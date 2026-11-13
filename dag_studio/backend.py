@@ -846,6 +846,35 @@ class Equation:
         return rows
 
 
+# FiveThirtyEight blue and red; the pale tints are 45% of each mixed with white.
+EFFECT_BLUE, EFFECT_RED = "#008FD5", "#FC4F30"
+EFFECT_COLOURS = {
+    "pos": EFFECT_BLUE,
+    "neg": EFFECT_RED,
+    "pos_weak": "#8CCCEC",
+    "neg_weak": "#FDB0A2",
+}
+
+
+def edge_effects(equations: dict[str, "Equation"], edges: list[Edge]) -> dict[str, tuple[str, Term]]:
+    """Sign of each fitted edge's direct coefficient, keyed by ``Edge.key``.
+
+    The sign is "pos" or "neg" (on the link scale for non-gaussian children),
+    with "_weak" appended when the credible interval includes zero.
+    """
+    effects: dict[str, tuple[str, Term]] = {}
+    for e in edges:
+        equation = equations.get(e.target) if e.directed else None
+        term = next((t for t in equation.terms if t.name == e.source), None) if equation else None
+        if term is None:
+            continue
+        sign = "pos" if term.mean >= 0 else "neg"
+        if term.lower <= 0 <= term.upper:
+            sign += "_weak"
+        effects[e.key] = (sign, term)
+    return effects
+
+
 def _interval_columns(summary) -> tuple[str, str, str]:
     bounds = [c for c in summary.columns if c.startswith(("eti", "hdi"))]
     lb = next(c for c in bounds if c.endswith("lb"))

@@ -348,3 +348,31 @@ def test_validate_refuses_unfinished_graphs():
         b.validate_graph(
             df, ["price", "demand"], [b.Edge("price", "demand"), b.Edge("demand", "price")]
         )
+
+
+def test_edge_effects_sign_and_uncertainty():
+    t = lambda name, mean, lo, hi: b.Term(name, mean, lo, hi)  # noqa: E731
+    equations = {
+        "demand": b.Equation(
+            "demand", t("Intercept", 0, -1, 1),
+            [t("price", -0.7, -0.8, -0.6), t("promo", 0.05, -0.1, 0.2)], None, "89%",
+        ),
+        "revenue": b.Equation(
+            "revenue", t("Intercept", 0, -1, 1),
+            [t("demand", 0.85, 0.8, 0.9), t("price", -0.02, -0.1, 0.06)], None, "89%",
+        ),
+    }
+    edges = [
+        b.Edge("price", "demand"), b.Edge("promo", "demand"), b.Edge("demand", "revenue"),
+        b.Edge("price", "revenue"), b.Edge("season", "promo"),  # no equation for promo
+        b.Edge("demand", "x", directed=False),
+    ]
+    signs = {k: sign for k, (sign, _) in b.edge_effects(equations, edges).items()}
+    assert signs == {
+        b.edge_key("price", "demand"): "neg",
+        b.edge_key("promo", "demand"): "pos_weak",
+        b.edge_key("demand", "revenue"): "pos",
+        b.edge_key("price", "revenue"): "neg_weak",
+    }
+    assert set(signs.values()) <= set(b.EFFECT_COLOURS)
+    assert b.EFFECT_COLOURS["pos"] == "#008FD5" and b.EFFECT_COLOURS["neg"] == "#FC4F30"

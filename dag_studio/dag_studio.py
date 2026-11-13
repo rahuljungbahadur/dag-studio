@@ -272,19 +272,20 @@ def left_panel() -> rx.Component:
 
 
 def edge_el(e: EdgeView) -> rx.Component:
-    colour = rx.cond(e.selected, ACCENT, rx.cond(e.flagged, AMBER, EDGE))
+    # Colour, width and opacity are worked out in State._refresh.
     return rx.el.svg.g(
         rx.el.svg.path(
-            d=e.d, fill="none", stroke=colour,
-            stroke_width=rx.cond(e.selected, "2.4", "1.5"),
+            d=e.d, fill="none", stroke=e.colour, stroke_width=e.width,
             stroke_dasharray=rx.cond(e.directed, "none", "5 4"),
         ),
-        rx.cond(e.directed, rx.el.svg.polygon(points=e.arrow, fill=colour)),
+        rx.cond(e.directed, rx.el.svg.polygon(points=e.arrow, fill=e.colour)),
         # Wide invisible stroke so the edge is easy to click.
         rx.el.svg.path(
             d=e.d, fill="none", stroke="transparent", stroke_width="16",
             pointer_events="stroke", cursor="pointer", on_click=State.select_edge(e.id),
         ),
+        rx.el.svg.title(e.tooltip),
+        opacity=e.opacity,
     )
 
 
@@ -293,8 +294,13 @@ def node_el(n: NodeView) -> rx.Component:
         rx.el.svg.rect(
             x=n.box_x, y=n.box_y, width=str(int(b.NODE_W)), height=str(int(b.NODE_H)), rx="6",
             fill=rx.cond(n.picked, "#eff6ff", "white"),
-            stroke=rx.cond(n.picked, ACCENT, rx.cond(n.flagged, AMBER, rx.cond(n.is_target, INK, EDGE))),
-            stroke_width=rx.cond(n.picked | n.flagged | n.is_target, "1.8", "1"),
+            stroke=rx.cond(
+                n.picked | n.neighbour, ACCENT,
+                rx.cond(n.flagged, AMBER, rx.cond(n.is_target, INK, EDGE)),
+            ),
+            stroke_width=rx.cond(
+                n.picked, "2.4", rx.cond(n.neighbour | n.flagged | n.is_target, "1.8", "1")
+            ),
         ),
         rx.el.svg.text(
             n.label, x=n.text_x, y=n.text_y, text_anchor="middle",
@@ -319,6 +325,25 @@ def node_el(n: NodeView) -> rx.Component:
         ),
         rx.el.svg.title(n.tooltip),
         on_click=State.click_node(n.id), cursor="pointer",
+        opacity=rx.cond(n.dimmed, "0.3", "1"),
+    )
+
+
+def swatch(colour: str) -> rx.Component:
+    return rx.box(width="18px", height="3px", border_radius="2px", background=colour)
+
+
+def effect_legend() -> rx.Component:
+    return rx.cond(
+        State.shows_effects,
+        rx.hstack(
+            hint("Edge colour = sign of the fitted direct effect:"),
+            swatch(b.EFFECT_BLUE), hint("raises its child"),
+            swatch(b.EFFECT_RED), hint("lowers it"),
+            swatch(b.EFFECT_COLOURS["pos_weak"]), swatch(b.EFFECT_COLOURS["neg_weak"]),
+            hint("pale: 89% interval includes 0"),
+            spacing="2", align="center", wrap="wrap", width="100%",
+        ),
     )
 
 
@@ -351,14 +376,15 @@ def centre_panel() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             hint(
-                "Click a node to describe it, or an edge to inspect it. Add edges "
-                "from the left panel. Dashed edges have no direction yet."
+                "Click a node to highlight its connections and describe it, or an edge to "
+                "inspect it. Add edges from the left panel. Dashed edges have no direction yet."
             ),
             rx.spacer(),
             rx.button("Tidy layout", on_click=State.tidy_layout, size="1", variant="ghost",
                       color_scheme="gray"),
             width="100%", align="center",
         ),
+        effect_legend(),
         rx.cond(
             State.has_data,
             rx.box(graph_canvas(), width="100%", border=f"1px solid {LINE}", border_radius="8px",

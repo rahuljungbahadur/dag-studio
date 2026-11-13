@@ -91,6 +91,11 @@ instruction.
    the fit can be reproduced outside the app.
 6. **Click any edge** to see its fitted relationship and the fitted equation
    of its end node on the right.
+   After a fit, each edge is coloured by the sign of its direct coefficient:
+   blue (#008FD5) when it raises its child, red (#FC4F30) when it lowers it,
+   and a pale tint when the 89% interval includes zero. Hover an edge for the
+   number. Clicking a node highlights its edges and the nodes they connect
+   to, and dims the rest.
 7. **Export DOT** saves the graph, with flagged items listed as comments. The
    file can be passed straight to `pathmc.dag_to_spec`.
 

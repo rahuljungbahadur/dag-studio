@@ -40,6 +40,8 @@ class NodeView:
     tooltip: str  # full name, plus the description when there is one
     described: bool
     hinted: bool  # part of the selected validation violation
+    neighbour: bool  # connected to the picked node
+    dimmed: bool  # a node is picked and this one is not connected to it
 
 
 @dataclasses.dataclass
@@ -54,6 +56,10 @@ class EdgeView:
     selected: bool
     d: str
     arrow: str
+    colour: str
+    width: str
+    opacity: str
+    tooltip: str
 
 
 @dataclasses.dataclass
@@ -91,6 +97,10 @@ class PriorRow:
 
 
 _SYMBOLS = {"mu": "μ", "sigma": "σ", "alpha": "α", "beta": "β"}
+
+
+# Graph colours (kept in step with dag_studio.py).
+_ACCENT, _AMBER, _EDGE = "#2563eb", "#d97706", "#9aa5b1"
 
 
 def _short(name: str, limit: int = 13) -> str:
@@ -185,6 +195,16 @@ class State(rx.State):
         width, height = b.canvas_size(pos)
         self.canvas_w, self.canvas_h = int(width), int(height)
 
+        picked = self.picked
+        neighbours = {e.target for e in edges if e.source == picked} | {
+            e.source for e in edges if e.target == picked
+        }
+        effects = (
+            b.edge_effects(self._session().get("equations", {}), edges)
+            if self.fitted and not self.stale
+            else {}
+        )
+
         self.node_views = [
             NodeView(
                 id=n,
@@ -202,6 +222,8 @@ class State(rx.State):
                 tooltip=f"{n}\n{self.descriptions[n]}" if self.descriptions.get(n) else n,
                 described=bool(self.descriptions.get(n, "").strip()),
                 hinted=n in hinted,
+                neighbour=n in neighbours,
+                dimmed=bool(picked) and n != picked and n not in neighbours,
             )
             for n in self.nodes
         ]
@@ -227,6 +249,24 @@ class State(rx.State):
         for e in edges:
             others = [p for n, p in pos.items() if n not in (e.source, e.target)]
             d, arrow = b.edge_geometry(pos[e.source], pos[e.target], e.directed, others)
+            selected = e.key == self.selected_edge
+            incident = picked in (e.source, e.target)
+            sign, term = effects.get(e.key, ("", None))
+            if sign:
+                colour = b.EFFECT_COLOURS[sign]  # the fitted sign wins over highlight colours
+            elif selected or incident:
+                colour = _ACCENT
+            elif e.key in self.flagged_edges:
+                colour = _AMBER
+            else:
+                colour = _EDGE
+            arrow_char = "→" if e.directed else "—"
+            tooltip = f"{e.source} {arrow_char} {e.target}"
+            if term is not None:
+                tooltip += (
+                    f": direct coefficient {term.mean:.3f} "
+                    f"[{term.lower:.3f}, {term.upper:.3f}]"
+                )
             views.append(
                 EdgeView(
                     id=e.key,
@@ -234,9 +274,13 @@ class State(rx.State):
                     target=e.target,
                     directed=e.directed,
                     flagged=e.key in self.flagged_edges,
-                    selected=e.key == self.selected_edge,
+                    selected=selected,
                     d=d,
                     arrow=arrow,
+                    colour=colour,
+                    width="3" if selected or incident else ("2.2" if sign else "1.5"),
+                    opacity="0.2" if picked and not incident else "1",
+                    tooltip=tooltip,
                 )
             )
         self.edge_views = views
@@ -316,6 +360,10 @@ class State(rx.State):
     @rx.var
     def picked_flagged(self) -> bool:
         return self.picked in self.flagged_nodes
+
+    @rx.var
+    def shows_effects(self) -> bool:
+        return self.fitted and not self.stale
 
     @rx.var
     def has_validation(self) -> bool:
@@ -603,6 +651,7 @@ class State(rx.State):
         if families != self.families:
             self.families = families
             self._graph_changed()
+            self._refresh()
             self._check_family(node, family)
 
     @rx.event
@@ -622,12 +671,14 @@ class State(rx.State):
         if prior_text != self.prior_text:
             self.prior_text = prior_text
             self._graph_changed()
+            self._refresh()
 
     @rx.event
     def reset_priors(self):
         if self.picked in self.prior_text:
             self.prior_text = {n: v for n, v in self.prior_text.items() if n != self.picked}
             self._graph_changed()
+            self._refresh()
 
     @rx.event
     def remove_node(self):
@@ -750,6 +801,7 @@ class State(rx.State):
             session["equations"] = equations
             self.fitted, self.stale, self.spec, self.busy = True, False, spec, ""
             self.fit_code = code
+            self._refresh()
         return State.show_selected_edge
 
     @rx.event(background=True)
