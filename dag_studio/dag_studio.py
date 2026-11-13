@@ -189,6 +189,32 @@ def violation_row(v: ViolationView) -> rx.Component:
     )
 
 
+def violation_list() -> rx.Component:
+    """The violated pairs, collapsed until the header is clicked."""
+    return rx.vstack(
+        rx.hstack(
+            rx.text(rx.cond(State.violations_open, "▾", "▸"), size="1", color=MUTED,
+                    width="10px"),
+            rx.text(State.violations_header, size="1", weight="medium", color=INK),
+            spacing="2", align="center", cursor="pointer", width="100%",
+            on_click=State.toggle_violations,
+        ),
+        rx.cond(
+            State.violations_open,
+            rx.vstack(
+                rx.foreach(State.violation_views, violation_row),
+                hint(
+                    "Click a pair to see it on the graph. Add an edge only if it makes sense in "
+                    "your domain: some violations are chance, and a link can also come from a "
+                    "missing common cause. A pair leaves this list once you connect it."
+                ),
+                spacing="2", width="100%", align="stretch",
+            ),
+        ),
+        spacing="2", width="100%", align="stretch",
+    )
+
+
 def validate_step() -> rx.Component:
     tone = rx.match(State.verdict_tone, ("good", GREEN), ("bad", RED), INK)
     return step(
@@ -214,13 +240,14 @@ def validate_step() -> rx.Component:
                 rx.text(State.verdict, size="2", weight="medium", color=tone),
                 hint(State.verdict_detail),
                 rx.text(State.violation_summary, size="1", color=INK, line_height="1.5"),
-                rx.foreach(State.violation_views, violation_row),
                 rx.cond(
-                    State.violation_views.length() > 0,
-                    hint(
-                        "Click a violation to see the pair on the graph. Add an edge only if it "
-                        "makes sense in your domain: some violations are chance, and a link can "
-                        "also come from a missing common cause."
+                    State.n_found == 0,
+                    hint("No violations: the data show no link that the graph rules out."),
+                    rx.cond(
+                        State.violations_left == 0,
+                        hint("Every flagged pair is now connected. Validate again to re-check.",
+                             color=GREEN),
+                        violation_list(),
                     ),
                 ),
                 spacing="2", width="100%", align="stretch",
@@ -284,13 +311,19 @@ def node_el(n: NodeView) -> rx.Component:
     return rx.el.svg.g(
         rx.el.svg.rect(
             x=n.box_x, y=n.box_y, width=str(int(b.NODE_W)), height=str(int(b.NODE_H)), rx="6",
-            fill=rx.cond(n.picked, "#eff6ff", "white"),
+            fill=rx.cond(n.in_cycle, b.CYCLE_FILL, rx.cond(n.picked, "#eff6ff", "white")),
             stroke=rx.cond(
-                n.picked | n.neighbour, ACCENT,
-                rx.cond(n.flagged, AMBER, rx.cond(n.is_target, INK, EDGE)),
+                n.in_cycle, b.CYCLE_COLOUR,
+                rx.cond(
+                    n.picked | n.neighbour, ACCENT,
+                    rx.cond(n.flagged, AMBER, rx.cond(n.is_target, INK, EDGE)),
+                ),
             ),
             stroke_width=rx.cond(
-                n.picked, "2.4", rx.cond(n.neighbour | n.flagged | n.is_target, "1.8", "1")
+                n.in_cycle, "3",
+                rx.cond(
+                    n.picked, "2.4", rx.cond(n.neighbour | n.flagged | n.is_target, "1.8", "1")
+                ),
             ),
         ),
         rx.el.svg.text(
@@ -354,6 +387,15 @@ def graph_canvas() -> rx.Component:
                 pointer_events="none",
             ),
         ),
+        rx.cond(
+            State.cycle_line.length() == 4,
+            rx.el.svg.line(
+                x1=State.cycle_line[0], y1=State.cycle_line[1],
+                x2=State.cycle_line[2], y2=State.cycle_line[3],
+                stroke=b.CYCLE_COLOUR, stroke_width="3", stroke_dasharray="6 5",
+                pointer_events="none",
+            ),
+        ),
         rx.foreach(State.node_views, node_el),
         view_box=f"0 0 {State.canvas_w} {State.canvas_h}",
         width=State.canvas_w,
@@ -383,6 +425,17 @@ def edge_toolbar() -> rx.Component:
     )
 
 
+def cycle_note() -> rx.Component:
+    return rx.cond(
+        State.cycle_note != "",
+        rx.hstack(
+            swatch(b.CYCLE_COLOUR),
+            rx.text(State.cycle_note, size="1", color=INK, line_height="1.5"),
+            spacing="2", align="center", width="100%",
+        ),
+    )
+
+
 def centre_panel() -> rx.Component:
     return rx.vstack(
         rx.hstack(
@@ -396,6 +449,7 @@ def centre_panel() -> rx.Component:
             width="100%", align="center",
         ),
         rx.cond(State.has_data, edge_toolbar()),
+        cycle_note(),
         effect_legend(),
         rx.cond(
             State.has_data,

@@ -59,22 +59,52 @@ def edge_key(a: str, b: str) -> str:
     return f"{lo}~{hi}"
 
 
-def creates_cycle(edges: list[Edge], source: str, target: str) -> bool:
-    """True if adding ``source -> target`` closes a directed cycle."""
+def directed_path(edges: list[Edge], start: str, end: str) -> list[str]:
+    """Nodes of a directed path ``start -> ... -> end`` (shortest), or [] if none."""
     children: dict[str, list[str]] = {}
     for e in edges:
         if e.directed:
             children.setdefault(e.source, []).append(e.target)
-    stack, seen = [target], set()
-    while stack:
-        node = stack.pop()
-        if node == source:
-            return True
-        if node in seen:
-            continue
-        seen.add(node)
-        stack.extend(children.get(node, []))
-    return False
+    came_from: dict[str, str | None] = {start: None}
+    queue = [start]
+    for node in queue:
+        if node == end:
+            path = [node]
+            while came_from[path[-1]] is not None:
+                path.append(came_from[path[-1]])  # type: ignore[arg-type]
+            return path[::-1]
+        for child in children.get(node, []):
+            if child not in came_from:
+                came_from[child] = node
+                queue.append(child)
+    return []
+
+
+def creates_cycle(edges: list[Edge], source: str, target: str) -> bool:
+    """True if adding ``source -> target`` closes a directed cycle."""
+    return bool(directed_path(edges, target, source))
+
+
+def cycle_closed_by(edges: list[Edge], source: str, target: str) -> list[str]:
+    """The cycle that adding ``source -> target`` would close, as nodes in order.
+
+    The list runs ``target -> ... -> source`` along existing edges; the new edge
+    would close it from the last node back to the first. Empty if it closes none.
+    """
+    return directed_path(edges, target, source)
+
+
+def find_cycle(edges: list[Edge]) -> list[str]:
+    """Nodes of one directed cycle already in the graph, in order, or [] if acyclic.
+
+    The edge from the last node back to the first is the one that closes it.
+    """
+    directed = [e for e in edges if e.directed]
+    for e in directed:
+        path = directed_path([x for x in directed if x is not e], e.target, e.source)
+        if path:
+            return path
+    return []
 
 
 def graph_problems(nodes: list[str], edges: list[Edge], target: str = "") -> list[str]:
@@ -984,6 +1014,9 @@ class Equation:
             ))
         return rows
 
+
+# FiveThirtyEight yellow, for cycles; the fill is 20% of it mixed with white.
+CYCLE_COLOUR, CYCLE_FILL = "#E5AE38", "#FBF1DA"
 
 # FiveThirtyEight blue and red; the pale tints are 45% of each mixed with white.
 EFFECT_BLUE, EFFECT_RED = "#008FD5", "#FC4F30"

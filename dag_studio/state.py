@@ -42,6 +42,7 @@ class NodeView:
     hinted: bool  # part of the selected validation violation
     neighbour: bool  # connected to the picked node
     dimmed: bool  # a node is picked and this one is not connected to it
+    in_cycle: bool  # part of the highlighted cycle
 
 
 @dataclasses.dataclass
@@ -145,6 +146,9 @@ class State(rx.State):
     # --- derived views for rendering ----------------------------------
     node_views: list[NodeView] = []
     edge_views: list[EdgeView] = []
+    refused_cycle: list[str] = []  # cycle (target ... source) a refused edit would close
+    cycle_note: str = ""
+    cycle_line: list[str] = []  # x1, y1, x2, y2 of the refused edge
     canvas_w: int = 640
     canvas_h: int = 320
 
@@ -157,6 +161,8 @@ class State(rx.State):
     violation_summary: str = ""
     violation_views: list[ViolationView] = []
     selected_violation: str = ""
+    violations_open: bool = False  # the violation list is collapsed by default
+    n_found: int = 0  # violations the last check found, before any were fixed
     hint_line: list[str] = []  # x1, y1, x2, y2 of the selected violation's pair
     _violations: list[dict] = []
 
@@ -199,7 +205,15 @@ class State(rx.State):
     def _refresh(self, relayout: bool = False) -> None:
         """Rebuild the SVG views from the source-of-truth graph."""
         edges = self._edge_objects()
-        chosen = next((v for v in self._violations if v["key"] == self.selected_violation), None)
+        # A violation is fixed once its two nodes are connected (or one is removed).
+        connected = {e.key for e in edges}
+        live = [
+            v for v in self._violations
+            if v["key"] not in connected and v["x"] in self.nodes and v["y"] in self.nodes
+        ]
+        if self.selected_violation not in {v["key"] for v in live}:
+            self.selected_violation = ""
+        chosen = next((v for v in live if v["key"] == self.selected_violation), None)
         hinted = {chosen["x"], chosen["y"]} if chosen else set()
         if relayout or set(self.positions) != set(self.nodes):
             pos = b.layout(self.nodes, edges, self.target)
@@ -217,6 +231,27 @@ class State(rx.State):
             if self.fitted and not self.stale
             else {}
         )
+
+        # A cycle already in the graph, else the one a refused edit would have closed.
+        ring = b.find_cycle(edges)
+        closing = None  # the refused edge, drawn as a line, when the cycle is not in the graph
+        if ring:
+            ring_edges = {(ring[i], ring[(i + 1) % len(ring)]) for i in range(len(ring))}
+            path = " → ".join(ring + [ring[0]])
+            self.cycle_note = f"The graph contains a cycle: {path}"
+        elif len(self.refused_cycle) > 1 and all(n in pos for n in self.refused_cycle):
+            ring = self.refused_cycle
+            ring_edges = set(zip(ring, ring[1:]))
+            closing = (ring[-1], ring[0])
+            self.cycle_note = f"Not added: it would close the cycle {' → '.join(ring + [ring[0]])}"
+        else:
+            ring, ring_edges, self.cycle_note = [], set(), ""
+        in_ring = set(ring)
+        if closing:
+            (x1, y1), (x2, y2) = pos[closing[0]], pos[closing[1]]
+            self.cycle_line = [f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}"]
+        else:
+            self.cycle_line = []
 
         self.node_views = [
             NodeView(
@@ -236,7 +271,11 @@ class State(rx.State):
                 described=bool(self.descriptions.get(n, "").strip()),
                 hinted=n in hinted,
                 neighbour=n in neighbours,
-                dimmed=bool(chosen_nodes) and n not in chosen_nodes and n not in neighbours,
+                dimmed=(
+                    bool(chosen_nodes) and n not in chosen_nodes and n not in neighbours
+                    and n not in in_ring
+                ),
+                in_cycle=n in in_ring,
             )
             for n in self.nodes
         ]
@@ -256,7 +295,7 @@ class State(rx.State):
                 forward=f"Add {v['x']} → {v['y']}",
                 backward=f"Add {v['y']} → {v['x']}",
             )
-            for v in self._violations
+            for v in live
         ]
         views = []
         for e in edges:
@@ -264,8 +303,11 @@ class State(rx.State):
             d, arrow = b.edge_geometry(pos[e.source], pos[e.target], e.directed, others)
             selected = e.key == self.selected_edge
             incident = e.source in chosen_nodes or e.target in chosen_nodes
+            on_cycle = (e.source, e.target) in ring_edges
             sign, term = effects.get(e.key, ("", None))
-            if sign:
+            if on_cycle:
+                colour = b.CYCLE_COLOUR  # a cycle is a problem: it wins over every other colour
+            elif sign:
                 colour = b.EFFECT_COLOURS[sign]  # the fitted sign wins over highlight colours
             elif selected or incident:
                 colour = _ACCENT
@@ -291,8 +333,11 @@ class State(rx.State):
                     d=d,
                     arrow=arrow,
                     colour=colour,
-                    width="3" if selected or incident else ("2.2" if sign else "1.5"),
-                    opacity="0.2" if chosen_nodes and not incident else "1",
+                    width=(
+                        "3.4" if on_cycle
+                        else "3" if selected or incident else ("2.2" if sign else "1.5")
+                    ),
+                    opacity="0.2" if chosen_nodes and not incident and not on_cycle else "1",
                     tooltip=tooltip,
                 )
             )
@@ -300,6 +345,7 @@ class State(rx.State):
 
     def _graph_changed(self) -> None:
         """Call after any structural edit: the fitted model no longer matches."""
+        self.refused_cycle = []
         if self.fitted:
             self.stale = True
         self.has_curve = self.has_equation = False
@@ -310,6 +356,7 @@ class State(rx.State):
         self.flagged_nodes, self.flagged_edges = [], []
         self.positions, self.descriptions = {}, {}
         self.families, self.prior_text = {}, {}
+        self.refused_cycle, self.violations_open, self.n_found = [], False, 0
         self._violations, self.validated_sig, self.selected_violation = [], "", ""
         self.verdict = self.verdict_detail = self.violation_summary = ""
         self.selected_nodes, self.selected_edge = [], ""
@@ -402,6 +449,17 @@ class State(rx.State):
     @rx.var
     def has_validation(self) -> bool:
         return self.validated_sig != ""
+
+    @rx.var
+    def violations_left(self) -> int:
+        return len(self.violation_views)
+
+    @rx.var
+    def violations_header(self) -> str:
+        left = len(self.violation_views)
+        if left == self.n_found:
+            return f"Violated pairs ({left})"
+        return f"Violated pairs ({left} of {self.n_found} left)"
 
     @rx.var
     def validation_stale(self) -> bool:
@@ -538,7 +596,7 @@ class State(rx.State):
             session["evidence"], session["curves"] = evidence, {}
             session.pop("model", None)
             self.edges = [dataclasses.asdict(e) for e in edges]
-            self.flagged_edges = []
+            self.flagged_edges, self.refused_cycle = [], []
             self.selected_nodes, self.selected_edge = [], ""
             self.fitted = self.stale = self.has_curve = self.has_equation = False
             self.evidence_caption = ""
@@ -552,9 +610,12 @@ class State(rx.State):
     def _put_edge(self, source: str, target: str) -> None:
         """Set the edge between a pair to ``source -> target``."""
         key = b.edge_key(source, target)
+        self.refused_cycle = []
         others = [e for e in self.edges if b.edge_key(e["source"], e["target"]) != key]
         other_objects = [b.Edge(e["source"], e["target"], e["directed"]) for e in others]
-        if b.creates_cycle(other_objects, source, target):
+        cycle = b.cycle_closed_by(other_objects, source, target)
+        if cycle:
+            self.refused_cycle = cycle  # _refresh draws it in yellow until the next action
             self.error = f"{source} → {target} would create a cycle."
             return
         self.edges = others + [{"source": source, "target": target, "directed": True}]
@@ -569,7 +630,7 @@ class State(rx.State):
         one picked first to the one picked second. Clicking never adds an edge
         by itself. A third cmd-click drops the oldest of the two.
         """
-        self.error = ""
+        self.error, self.refused_cycle = "", []
         multi = bool(info.get("meta_key") or info.get("ctrl_key"))
         self.selected_nodes = b.next_selection(list(self.selected_nodes), node, multi)
         self.selected_edge = ""
@@ -579,6 +640,7 @@ class State(rx.State):
     @rx.event
     def swap_selected(self):
         """Reverse the direction of the pending edge."""
+        self.refused_cycle = []
         self.selected_nodes = list(reversed(self.selected_nodes))
         self._refresh()
 
@@ -597,13 +659,14 @@ class State(rx.State):
 
     @rx.event
     def clear_selection(self):
+        self.refused_cycle = []
         self.selected_nodes, self.selected_edge = [], ""
         self.has_curve = self.has_equation = False
         self._refresh()
 
     @rx.event
     def select_edge(self, key: str):
-        self.selected_nodes, self.error = [], ""
+        self.selected_nodes, self.error, self.refused_cycle = [], "", []
         self.selected_edge = "" if self.selected_edge == key else key
         self._refresh()
         return State.show_selected_edge
@@ -781,9 +844,18 @@ class State(rx.State):
                  "r": v.partial_corr, "p": v.p_value}
                 for v in result.violations
             ]
+            self.n_found = len(self._violations)
             self.selected_violation = ""
             self._refresh()
             self.busy = ""
+
+    @rx.event
+    def toggle_violations(self):
+        """Expand or collapse the list of violated pairs."""
+        self.violations_open = not self.violations_open
+        if not self.violations_open:
+            self.selected_violation = ""  # no stray highlight on the graph from a hidden row
+        self._refresh()
 
     @rx.event
     def select_violation(self, key: str):

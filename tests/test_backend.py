@@ -434,3 +434,20 @@ def test_next_selection():
     assert pick(["a", "b"], "a", True) == ["b"]
     # A third node pushes out the oldest, so the button never gets stuck.
     assert pick(["a", "b"], "c", True) == ["b", "c"]
+
+
+def test_cycle_helpers():
+    chain = [b.Edge("a", "b"), b.Edge("b", "c"), b.Edge("c", "d")]
+    assert b.directed_path(chain, "a", "d") == ["a", "b", "c", "d"]
+    assert b.directed_path(chain, "d", "a") == []
+    assert b.directed_path(chain, "a", "a") == ["a"]
+    # Undirected edges are not paths.
+    assert b.directed_path([b.Edge("a", "b", False)], "a", "b") == []
+    # The cycle a refused edge would close runs target -> ... -> source.
+    assert b.cycle_closed_by(chain, "d", "a") == ["a", "b", "c", "d"]
+    assert b.cycle_closed_by(chain, "a", "d") == []
+    # A cycle that is already in the graph.
+    assert b.find_cycle(chain) == []
+    ring = b.find_cycle(chain + [b.Edge("d", "b")])
+    assert sorted(ring) == ["b", "c", "d"]
+    assert all(b.Edge(x, y) in chain + [b.Edge("d", "b")] for x, y in zip(ring, ring[1:]))

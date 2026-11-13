@@ -77,15 +77,22 @@ instruction.
      the coefficient prior Normal(μ, σ), shared by the intercept and every
      slope, plus the noise, degrees-of-freedom or dispersion prior the family
      uses. Empty boxes keep pathmc's defaults.
-   - Edits that would create a cycle are refused.
+   - Edits that would create a cycle are refused, and the cycle the edit would
+     have closed is drawn in yellow (FiveThirtyEight's #E5AE38): its nodes and
+     edges, plus a dashed line for the refused edge, with the path named above
+     the graph. It clears on your next action. A cycle already present in the
+     graph is highlighted the same way.
 4. **Validate DAG** checks the graph against the data, with no fit needed.
    Every independence the graph implies ("A and B are unrelated once you know
    Z") is tested with pathmc's `test_implications`, including the ones implied
    by unconnected nodes. `PathModel.falsify` then grades the whole graph
-   against randomly relabelled versions of itself. Violations are listed
-   strongest first, with how many to expect by chance at the chosen α. Click
-   one to highlight the pair on the graph and add an edge in either
-   direction. The check is marked out of date when the graph changes.
+   against randomly relabelled versions of itself. The violated pairs sit in a
+   list that is collapsed by default (click its header to open it), strongest
+   first, with how many to expect by chance at the chosen α. Click a pair to
+   highlight it on the graph and add an edge in either direction. A pair
+   leaves the list as soon as you connect it, by any route, and the header
+   counts what is left ("1 of 3 left"). The check is marked out of date when
+   the graph changes.
 5. **Fit model** once every edge has a direction and the outcome has at least
    one edge. The graph, outcome, families and priors go to pathmc's
    `BuildModelFromDAG(style="native")`, then MCMC runs (roughly 10 to 60
@@ -130,7 +137,7 @@ drop zone too. Things to check:
   effect). Click it and choose **Add v_2024_price_index → revenue**; the check
   is marked out of date. Validate again: what's left (about 2) is no more
   than chance would flag. Try ⌘-clicking `revenue`, then `ad_spend`, and
-  pressing Add edge to see the cycle check refuse it.
+  pressing Add edge: the refused edit shows the cycle it would close in yellow.
 - Click a node, type a description, hover the node to see it, then
   **Export DOT** and look for the `tooltip` attribute.
 - **Fit model**, then click `orders → revenue`: the equation appears at once,
