@@ -425,6 +425,162 @@ def edge_geometry(
 
 
 # --------------------------------------------------------------------------
+# Validation: does the data contradict the graph? (no fit needed)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Violation:
+    """An independence the graph implies but the data reject."""
+
+    x: str
+    y: str
+    given: list[str]
+    partial_corr: float
+    p_value: float
+
+    @property
+    def key(self) -> str:
+        return edge_key(self.x, self.y)
+
+
+@dataclass
+class Validation:
+    verdict: str  # one-line whole-graph verdict
+    detail: str
+    tone: str  # "good", "bad" or "neutral"
+    n_tests: int  # independence statements tested
+    alpha: float
+    violations: list[Violation]  # strongest (smallest p) first
+    n_collapsed: int  # tests skipped because a conditioner was redundant
+
+    @property
+    def expected_by_chance(self) -> float:
+        return self.alpha * self.n_tests
+
+
+def validate_graph(
+    df: pl.DataFrame, nodes: list[str], edges: list[Edge], alpha: float = 0.05
+) -> Validation:
+    """Test the graph against the data with pathmc, without fitting a model.
+
+    1. Every conditional independence the DAG implies (Shipley's basis set,
+       from ``PathModel.implied_independences``) is tested with pathmc's
+       partial-correlation test. pathmc's spec cannot hold nodes without
+       edges, so their statements are added here: an unconnected node ``n``
+       implies ``n ⊥ y | parents(y)`` for every other node ``y``.
+    2. ``PathModel.falsify`` grades the connected graph as a whole against
+       randomly relabelled versions of itself (Eulig et al., 2023).
+    """
+    import narwhals as nw
+    import pathmc
+    from pathmc.identify import ConditionalIndependence, test_implications
+
+    if any(not e.directed for e in edges):
+        raise ValueError("Orient every dashed edge before validating.")
+    for e in edges:
+        if creates_cycle([x for x in edges if x is not e], e.source, e.target):
+            raise ValueError("The graph contains a directed cycle.")
+    if len(nodes) < 2:
+        raise ValueError("Need at least two nodes to validate.")
+
+    connected = sorted({e.source for e in edges} | {e.target for e in edges})
+    statements: list = []
+    model = None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if edges:
+            spec = dag_to_spec_from_edges(edges)
+            model = pathmc.model(spec, data=df.select(connected).to_pandas())
+            statements.extend(model.implied_independences())
+        parents = {n: frozenset(e.source for e in edges if e.target == n) for n in nodes}
+        isolated = [n for n in nodes if n not in connected]
+        for i, n in enumerate(isolated):
+            for other in nodes:
+                if other == n or other in isolated[:i]:
+                    continue
+                statements.append(ConditionalIndependence(n, other, parents[other]))
+
+        frame = pd.DataFrame()
+        if statements:
+            data = nw.from_native(df.select(nodes).to_pandas(), eager_only=True)
+            frame = test_implications(statements, data, alpha=alpha).to_dataframe()
+
+    violations = []
+    if not frame.empty:
+        for row in frame[frame["significant"]].sort_values("p_value").itertuples():
+            given = [g.strip() for g in str(row.conditioning_set).split(",") if g.strip()]
+            violations.append(
+                Violation(str(row.x), str(row.y), given, float(row.partial_corr),
+                          float(row.p_value))
+            )
+    n_collapsed = int(frame["rank_collapsed"].sum()) if not frame.empty else 0
+
+    verdict, detail, tone = _falsify_verdict(model, connected, isolated)
+    return Validation(verdict, detail, tone, len(frame), alpha, violations, n_collapsed)
+
+
+def dag_to_spec_from_edges(edges: list[Edge]) -> str:
+    import pathmc
+
+    return pathmc.dag_to_spec(", ".join(f"{e.source}->{e.target}" for e in edges))
+
+
+def _falsify_verdict(model, connected: list[str], isolated: list[str]) -> tuple[str, str, str]:
+    """Whole-graph verdict from ``PathModel.falsify``."""
+    note = (
+        " This whole-graph test covers connected nodes only; unconnected nodes are "
+        "checked in the list below."
+        if isolated and model is not None
+        else ""
+    )
+    if model is None:
+        return (
+            "No edges to grade yet",
+            "The graph says every variable is unrelated to every other. The list below "
+            "tests exactly that.",
+            "neutral",
+        )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = model.falsify(random_seed=RANDOM_SEED)
+    except Exception as exc:  # noqa: BLE001 - small or saturated graphs can't be graded
+        return "Whole-graph test not available", f"pathmc could not run it: {exc}", "neutral"
+
+    status = str(result.status)
+    p = getattr(result, "p_value_lmc", float("nan"))
+    if status == "not_rejected":
+        return (
+            "Not contradicted by the data",
+            f"It breaks fewer of its own independence claims than randomly relabelled "
+            f"versions of the graph (p = {p:.3f}), and its structure is specific enough "
+            f"for that to mean something." + note,
+            "good",
+        )
+    if status == "rejected":
+        return (
+            "Contradicted by the data",
+            f"Randomly relabelled versions of the graph fit the data about as well "
+            f"(p = {p:.3f}). Look at the violations below." + note,
+            "bad",
+        )
+    if status == "not_falsifiable":
+        return (
+            "Not testable from the data",
+            "Too many rearrangements of this graph imply the same independences, so "
+            "the data can neither support nor reject it. Treat it as untested." + note,
+            "neutral",
+        )
+    return (
+        "Whole-graph test not available",
+        "The graph implies no testable independences between parents and children "
+        "(for example, every pair is connected)." + note,
+        "neutral",
+    )
+
+
+# --------------------------------------------------------------------------
 # Fitting and fitted relationships (pathmc PathModel)
 # --------------------------------------------------------------------------
 

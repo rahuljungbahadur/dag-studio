@@ -39,6 +39,7 @@ class NodeView:
     is_target: bool
     tooltip: str  # full name, plus the description when there is one
     described: bool
+    hinted: bool  # part of the selected validation violation
 
 
 @dataclasses.dataclass
@@ -62,6 +63,20 @@ class EquationRow:
     expr: str
     band: str
     highlight: bool  # the term for the selected edge
+
+
+@dataclasses.dataclass
+class ViolationView:
+    """One violated independence in the Validate step."""
+
+    key: str
+    x: str
+    y: str
+    given: str
+    stats: str
+    selected: bool
+    forward: str  # button labels
+    backward: str
 
 
 @dataclasses.dataclass
@@ -113,6 +128,18 @@ class State(rx.State):
     canvas_w: int = 640
     canvas_h: int = 320
 
+    # --- validation ---------------------------------------------------
+    alpha: str = "0.05"
+    validated_sig: str = ""  # graph signature at the last validation; "" = never
+    verdict: str = ""
+    verdict_detail: str = ""
+    verdict_tone: str = "neutral"
+    violation_summary: str = ""
+    violation_views: list[ViolationView] = []
+    selected_violation: str = ""
+    hint_line: list[str] = []  # x1, y1, x2, y2 of the selected violation's pair
+    _violations: list[dict] = []
+
     # --- model --------------------------------------------------------
     fitted: bool = False
     stale: bool = False  # graph edited since the last fit
@@ -140,9 +167,17 @@ class State(rx.State):
     def _edge_objects(self) -> list[b.Edge]:
         return [b.Edge(e["source"], e["target"], e["directed"]) for e in self.edges]
 
+    def _graph_sig(self) -> str:
+        edges = sorted(
+            f"{e['source']}{'>' if e['directed'] else '-'}{e['target']}" for e in self.edges
+        )
+        return "|".join(sorted(self.nodes)) + "#" + ",".join(edges)
+
     def _refresh(self, relayout: bool = False) -> None:
         """Rebuild the SVG views from the source-of-truth graph."""
         edges = self._edge_objects()
+        chosen = next((v for v in self._violations if v["key"] == self.selected_violation), None)
+        hinted = {chosen["x"], chosen["y"]} if chosen else set()
         if relayout or set(self.positions) != set(self.nodes):
             pos = b.layout(self.nodes, edges, self.target)
             self.positions = {n: [x, y] for n, (x, y) in pos.items()}
@@ -166,8 +201,27 @@ class State(rx.State):
                 is_target=n == self.target,
                 tooltip=f"{n}\n{self.descriptions[n]}" if self.descriptions.get(n) else n,
                 described=bool(self.descriptions.get(n, "").strip()),
+                hinted=n in hinted,
             )
             for n in self.nodes
+        ]
+        if chosen and chosen["x"] in pos and chosen["y"] in pos:
+            (x1, y1), (x2, y2) = pos[chosen["x"]], pos[chosen["y"]]
+            self.hint_line = [f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}"]
+        else:
+            self.hint_line = []
+        self.violation_views = [
+            ViolationView(
+                key=v["key"],
+                x=v["x"],
+                y=v["y"],
+                given=f"given {', '.join(v['given'])}" if v["given"] else "with nothing held fixed",
+                stats=f"partial r = {v['r']:.2f} · p = {v['p']:.2g}",
+                selected=v["key"] == self.selected_violation,
+                forward=f"Add {v['x']} → {v['y']}",
+                backward=f"Add {v['y']} → {v['x']}",
+            )
+            for v in self._violations
         ]
         views = []
         for e in edges:
@@ -199,6 +253,8 @@ class State(rx.State):
         self.flagged_nodes, self.flagged_edges = [], []
         self.positions, self.descriptions = {}, {}
         self.families, self.prior_text = {}, {}
+        self._violations, self.validated_sig, self.selected_violation = [], "", ""
+        self.verdict = self.verdict_detail = self.violation_summary = ""
         self.picked = self.selected_edge = ""
         self.fitted = self.stale = self.has_curve = self.has_equation = False
         self.spec = self.fit_code = ""
@@ -260,6 +316,37 @@ class State(rx.State):
     @rx.var
     def picked_flagged(self) -> bool:
         return self.picked in self.flagged_nodes
+
+    @rx.var
+    def has_validation(self) -> bool:
+        return self.validated_sig != ""
+
+    @rx.var
+    def validation_stale(self) -> bool:
+        return self.validated_sig != "" and self.validated_sig != self._graph_sig()
+
+    @rx.var
+    def can_validate(self) -> bool:
+        if not self.n_rows or self.busy or len(self.nodes) < 2:
+            return False
+        blocking = [p for p in b.graph_problems(self.nodes, self._edge_objects())
+                    if p != "The graph has no edges."]
+        return not blocking
+
+    @rx.var
+    def current_step(self) -> int:
+        """Where the user is in the guided flow (6 = everything done)."""
+        if not self.n_rows:
+            return 1
+        if not self.edges:
+            return 2
+        if self.problems:
+            return 3
+        if self.validated_sig != self._graph_sig():
+            return 4
+        if not self.fitted or self.stale:
+            return 5
+        return 6
 
     @rx.var
     def picked_family(self) -> str:
@@ -567,6 +654,63 @@ class State(rx.State):
             self.removed = [n for n in self.removed if n != node]
             self.nodes = self.nodes + [node]
             self._refresh(relayout=True)
+
+    @rx.event
+    def set_alpha(self, value: str):
+        self.alpha = value
+
+    @rx.event(background=True)
+    async def validate(self):
+        """Test the graph's implied independences against the data (no fit needed)."""
+        async with self:
+            if self.busy or not self.can_validate:
+                return
+            self.busy, self.error = "Validating the graph against the data…", ""
+            session, nodes, edges = self._session(), list(self.nodes), self._edge_objects()
+            alpha, sig = float(self.alpha), self._graph_sig()
+        try:
+            result = await asyncio.to_thread(b.validate_graph, session["df"], nodes, edges, alpha)
+        except Exception as exc:  # noqa: BLE001
+            async with self:
+                self.busy, self.error = "", f"Validation failed: {exc}"
+            return
+        async with self:
+            self.validated_sig = sig
+            self.verdict, self.verdict_detail = result.verdict, result.detail
+            self.verdict_tone = result.tone
+            n = len(result.violations)
+            self.violation_summary = (
+                f"{n} of {result.n_tests} implied independences "
+                f"{'is' if n == 1 else 'are'} violated. At α = {alpha:g}, about "
+                f"{result.expected_by_chance:.1f} would be flagged by chance alone."
+            )
+            if result.n_collapsed:
+                self.violation_summary += (
+                    f" {result.n_collapsed} test(s) skipped: a conditioning variable was redundant."
+                )
+            self._violations = [
+                {"key": v.key, "x": v.x, "y": v.y, "given": v.given,
+                 "r": v.partial_corr, "p": v.p_value}
+                for v in result.violations
+            ]
+            self.selected_violation = ""
+            self._refresh()
+            self.busy = ""
+
+    @rx.event
+    def select_violation(self, key: str):
+        self.selected_violation = "" if self.selected_violation == key else key
+        self._refresh()
+
+    @rx.event
+    def add_violation_edge(self, source: str, target: str):
+        """Add the edge a violation suggests (the user picks the direction)."""
+        self.error, self.picked = "", ""
+        if source in self.nodes and target in self.nodes:
+            self._put_edge(source, target)
+        self.selected_violation = ""
+        self._refresh()
+        return State.show_selected_edge
 
     @rx.event
     def tidy_layout(self):

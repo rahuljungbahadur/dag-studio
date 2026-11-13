@@ -5,7 +5,7 @@ from __future__ import annotations
 import reflex as rx
 
 from . import backend as b
-from .state import EdgeView, EquationRow, NodeView, PriorRow, State
+from .state import EdgeView, EquationRow, NodeView, PriorRow, State, ViolationView
 
 INK = "#1f2933"
 MUTED = "#7b8794"
@@ -13,6 +13,10 @@ LINE = "#e4e7eb"
 EDGE = "#9aa5b1"
 ACCENT = "#2563eb"
 AMBER = "#d97706"
+VIOLET = "#7c3aed"  # validation hints
+GREEN = "#15803d"
+GREEN_SOFT = "#dcfce7"
+RED = "#b42318"
 MONO = "ui-monospace, SFMono-Regular, Menlo, monospace"
 
 
@@ -33,20 +37,43 @@ def hint(*children, **props) -> rx.Component:
     return rx.text(*children, size="1", line_height="1.5", **props)
 
 
-def section(title: str, *children) -> rx.Component:
-    return rx.vstack(label(title), *children, spacing="2", width="100%", align="stretch")
-
-
 # --------------------------------------------------------------------------
 # Left panel: data, discovery, edits, fit
 # --------------------------------------------------------------------------
 
 
-def data_section() -> rx.Component:
-    return section(
-        "Data",
+def step(n: int, title: str, instruction: str, *body, needs_data: bool = True) -> rx.Component:
+    """A numbered step: ✓ when done, highlighted when it is the current one."""
+    done = State.current_step > n
+    current = State.current_step == n
+    badge = rx.center(
+        rx.cond(done, "✓", str(n)),
+        width="20px", height="20px", border_radius="50%", flex_shrink="0",
+        font_size="11px", font_weight="600",
+        background=rx.cond(current, ACCENT, rx.cond(done, GREEN_SOFT, "transparent")),
+        color=rx.cond(current, "white", rx.cond(done, GREEN, MUTED)),
+        border=rx.cond(current | done, "1px solid transparent", f"1px solid {EDGE}"),
+    )
+    content = rx.vstack(*body, spacing="2", width="100%", align="stretch", padding_top="4px")
+    return rx.vstack(
+        rx.hstack(
+            badge,
+            rx.text(title, size="2", weight="medium", color=rx.cond(current | done, INK, MUTED)),
+            spacing="2", align="center",
+        ),
+        hint(instruction, color=rx.cond(current, INK, MUTED)),
+        rx.cond(State.has_data, content) if needs_data else content,
+        spacing="1", width="100%", align="stretch", padding="10px", border_radius="8px",
+        background=rx.cond(current, "#f5f8ff", "transparent"),
+        border=rx.cond(current, "1px solid #dbe4ff", "1px solid transparent"),
+    )
+
+
+def data_step() -> rx.Component:
+    return step(
+        1, "Load data", "Upload a CSV or Parquet file. Numeric columns become nodes.",
         rx.upload(
-            rx.text("Drop a CSV or Parquet file, or click to browse", size="1", color=MUTED),
+            rx.text("Drop a file here, or click to browse", size="1", color=MUTED),
             id="data",
             accept={
                 "text/csv": [".csv"],
@@ -58,15 +85,16 @@ def data_section() -> rx.Component:
             on_drop=State.handle_upload(rx.upload_files(upload_id="data")),
             border=f"1px dashed {EDGE}",
             border_radius="6px",
-            padding="14px 10px",
+            padding="12px 10px",
             text_align="center",
             cursor="pointer",
+            background="white",
         ),
         rx.cond(
             State.has_data,
             hint(State.filename, " · ", State.n_rows, " rows · ", State.columns.length(), " variables"),
             hint(
-                "No file yet. ",
+                "No file yet? ",
                 rx.link("Load demo data", on_click=State.load_demo, size="1", underline="always"),
             ),
         ),
@@ -79,24 +107,29 @@ def data_section() -> rx.Component:
             rx.link("Download test file", size="1", underline="always",
                     on_click=rx.download(url=f"/{b.TEST_FILE.name}")),
         ),
+        needs_data=False,
     )
 
 
-def discover_section() -> rx.Component:
-    return section(
-        "Outcome",
+def discover_step() -> rx.Component:
+    return step(
+        2, "Discover",
+        "Pick the outcome you care about, then let TBFPC propose a graph. This replaces "
+        "the current edges.",
         rx.select(State.columns, value=State.target, on_change=State.set_target, size="1"),
         rx.button(
             "Discover DAG", on_click=State.discover, disabled=State.is_busy,
             size="1", variant="solid", color_scheme="gray", high_contrast=True,
         ),
-        hint("TBFPC searches for the drivers of the outcome. It replaces the current edges."),
     )
 
 
-def add_edge_section() -> rx.Component:
-    return section(
-        "Add edge",
+def edit_step() -> rx.Component:
+    return step(
+        3, "Review and edit",
+        "Use what you know about the domain: give every dashed edge a direction, and add, "
+        "reverse or delete edges. Click a node to describe it or set its model.",
+        rx.foreach(State.problems, lambda p: hint("• ", p, color=AMBER)),
         rx.grid(
             rx.select(State.nodes, value=State.new_from, on_change=State.set_new_from,
                       placeholder="from", size="1"),
@@ -106,59 +139,119 @@ def add_edge_section() -> rx.Component:
         ),
         rx.button("Add edge", on_click=State.add_edge, size="1", variant="soft",
                   color_scheme="gray"),
-        hint("Adding an edge between two nodes that are already connected re-points it."),
+        hint("Adding an edge between two connected nodes re-points it."),
+        rx.cond(
+            State.removed.length() > 0,
+            rx.vstack(
+                label("Removed nodes"),
+                rx.flex(
+                    rx.foreach(
+                        State.removed,
+                        lambda n: rx.badge(
+                            n, " +", on_click=State.restore_node(n), cursor="pointer",
+                            variant="outline", color_scheme="gray", size="1",
+                        ),
+                    ),
+                    wrap="wrap", spacing="1",
+                ),
+                hint("Click to put a node back."),
+                spacing="1", width="100%",
+            ),
+        ),
+        rx.cond(
+            State.review_queue.length() > 0,
+            rx.vstack(
+                label("Flagged for review"),
+                rx.flex(
+                    rx.foreach(
+                        State.review_queue,
+                        lambda item: rx.badge(item, variant="soft", color_scheme="amber",
+                                              size="1"),
+                    ),
+                    wrap="wrap", spacing="1",
+                ),
+                spacing="1", width="100%",
+            ),
+        ),
     )
 
 
-def removed_section() -> rx.Component:
-    return rx.cond(
-        State.removed.length() > 0,
-        section(
-            "Removed nodes",
+def violation_row(v: ViolationView) -> rx.Component:
+    return rx.vstack(
+        rx.text(v.x, " — ", v.y, size="1", weight="medium", color=INK),
+        hint(v.given),
+        hint(v.stats),
+        rx.cond(
+            v.selected,
             rx.flex(
-                rx.foreach(
-                    State.removed,
-                    lambda n: rx.badge(
-                        n, " +", on_click=State.restore_node(n), cursor="pointer",
-                        variant="outline", color_scheme="gray", size="1",
+                rx.button(v.forward, size="1", variant="soft", color_scheme="violet",
+                          on_click=State.add_violation_edge(v.x, v.y).stop_propagation),
+                rx.button(v.backward, size="1", variant="soft", color_scheme="violet",
+                          on_click=State.add_violation_edge(v.y, v.x).stop_propagation),
+                wrap="wrap", gap="6px", padding_top="4px",
+            ),
+        ),
+        spacing="0", width="100%", align="stretch", padding="6px 8px", border_radius="6px",
+        cursor="pointer", on_click=State.select_violation(v.key),
+        background=rx.cond(v.selected, "#f3efff", "white"),
+        border=rx.cond(v.selected, f"1px solid {VIOLET}", f"1px solid {LINE}"),
+    )
+
+
+def validate_step() -> rx.Component:
+    tone = rx.match(State.verdict_tone, ("good", GREEN), ("bad", RED), INK)
+    return step(
+        4, "Validate",
+        "Check the graph against the data. A violation is a pair the graph says are "
+        "unrelated, but the data link. No model fit is needed.",
+        rx.hstack(
+            rx.button("Validate DAG", on_click=State.validate, disabled=~State.can_validate,
+                      size="1", variant="solid", color_scheme="gray", high_contrast=True),
+            rx.spacer(),
+            rx.text("α", size="1", color=MUTED),
+            rx.select(["0.01", "0.05", "0.10"], value=State.alpha, on_change=State.set_alpha,
+                      size="1"),
+            width="100%", align="center", spacing="2",
+        ),
+        rx.cond(
+            State.has_validation,
+            rx.vstack(
+                rx.cond(
+                    State.validation_stale,
+                    hint("The graph changed since this check. Validate again.", color=AMBER),
+                ),
+                rx.text(State.verdict, size="2", weight="medium", color=tone),
+                hint(State.verdict_detail),
+                rx.text(State.violation_summary, size="1", color=INK, line_height="1.5"),
+                rx.foreach(State.violation_views, violation_row),
+                rx.cond(
+                    State.violation_views.length() > 0,
+                    hint(
+                        "Click a violation to see the pair on the graph. Add an edge only if it "
+                        "makes sense in your domain: some violations are chance, and a link can "
+                        "also come from a missing common cause."
                     ),
                 ),
-                wrap="wrap", spacing="1",
-            ),
-            hint("Click to put a node back."),
-        ),
-    )
-
-
-def review_section() -> rx.Component:
-    return rx.cond(
-        State.review_queue.length() > 0,
-        section(
-            "Flagged for review",
-            rx.flex(
-                rx.foreach(
-                    State.review_queue,
-                    lambda item: rx.badge(item, variant="soft", color_scheme="amber", size="1"),
-                ),
-                wrap="wrap", spacing="1",
+                spacing="2", width="100%", align="stretch",
             ),
         ),
     )
 
 
-def fit_section() -> rx.Component:
-    return section(
-        "Model",
+def fit_step() -> rx.Component:
+    return step(
+        5, "Fit and inspect",
+        "Fit the model, then click an edge to see its effect and fitted equation.",
         rx.button(
             rx.cond(State.stale, "Refit model", "Fit model"),
             on_click=State.fit, disabled=~State.can_fit,
             size="1", variant="solid", color_scheme="blue",
         ),
         rx.cond(
-            State.has_data,
-            rx.foreach(State.problems, lambda p: hint(p)),
+            State.problems.length() > 0,
+            hint("Finish step 3 first.", color=AMBER),
         ),
-        rx.cond(State.stale, hint("The graph changed since the last fit.", color=AMBER)),
+        rx.cond(State.stale, hint("The model changed since the last fit.", color=AMBER)),
         rx.button(
             "Export DOT", on_click=State.export_dot, disabled=~State.has_data,
             size="1", variant="ghost", color_scheme="gray",
@@ -168,15 +261,8 @@ def fit_section() -> rx.Component:
 
 def left_panel() -> rx.Component:
     return rx.vstack(
-        data_section(),
-        rx.cond(
-            State.has_data,
-            rx.vstack(
-                discover_section(), add_edge_section(), removed_section(), review_section(),
-                fit_section(), spacing="5", width="100%", align="stretch",
-            ),
-        ),
-        spacing="5", width="100%", align="stretch",
+        data_step(), discover_step(), edit_step(), validate_step(), fit_step(),
+        spacing="2", width="100%", align="stretch",
     )
 
 
@@ -223,6 +309,14 @@ def node_el(n: NodeView) -> rx.Component:
             n.described,
             rx.el.svg.circle(cx=n.note_x, cy=n.dot_y, r="3.5", fill=ACCENT),
         ),
+        rx.cond(
+            n.hinted,
+            rx.el.svg.rect(
+                x=n.box_x, y=n.box_y, width=str(int(b.NODE_W)), height=str(int(b.NODE_H)),
+                rx="6", fill="none", stroke=VIOLET, stroke_width="2.2",
+                stroke_dasharray="4 3", pointer_events="none",
+            ),
+        ),
         rx.el.svg.title(n.tooltip),
         on_click=State.click_node(n.id), cursor="pointer",
     )
@@ -235,6 +329,15 @@ def graph_canvas() -> rx.Component:
             fill="transparent", on_click=State.clear_selection,
         ),
         rx.foreach(State.edge_views, edge_el),
+        rx.cond(
+            State.hint_line.length() == 4,
+            rx.el.svg.line(
+                x1=State.hint_line[0], y1=State.hint_line[1],
+                x2=State.hint_line[2], y2=State.hint_line[3],
+                stroke=VIOLET, stroke_width="1.6", stroke_dasharray="2 4",
+                pointer_events="none",
+            ),
+        ),
         rx.foreach(State.node_views, node_el),
         view_box=f"0 0 {State.canvas_w} {State.canvas_h}",
         width=State.canvas_w,
@@ -487,7 +590,7 @@ def status_bar() -> rx.Component:
             State.is_busy,
             rx.hstack(rx.spinner(size="1"), hint(State.busy), spacing="2", align="center"),
         ),
-        rx.cond(State.error != "", rx.text(State.error, size="1", color="#b42318")),
+        rx.cond(State.error != "", rx.text(State.error, size="1", color=RED)),
         width="100%", align="center", spacing="3",
         padding_bottom="12px", border_bottom=f"1px solid {LINE}",
     )

@@ -303,3 +303,48 @@ def test_bernoulli_fit_through_builder(monkeypatch):
     curve = b.edge_curve(model, df, "x", "y")
     assert all(0 <= v <= 1 for v in curve.mean)  # a probability
     assert curve.mean[-1] > curve.mean[0]
+
+
+def _test_file_graph():
+    df, _ = b.load_table(b.TEST_FILE)
+    edges, _ = b.discover(df, target="revenue")
+    return df, [b.Edge(e.source, e.target) for e in edges]  # orient dashed edges as drawn
+
+
+def test_validate_flags_the_missing_edge_and_clears_once_added():
+    df, edges = _test_file_graph()
+    result = b.validate_graph(df, df.columns, edges)
+    assert result.tone == "good" and result.n_tests > 20
+    strongest = result.violations[0]
+    assert strongest.key == b.edge_key("revenue", "v_2024_price_index")
+    assert strongest.given == ["orders"] and strongest.p_value < 1e-10
+    assert [v.p_value for v in result.violations] == sorted(v.p_value for v in result.violations)
+
+    fixed = b.validate_graph(df, df.columns, edges + [b.Edge("v_2024_price_index", "revenue")])
+    assert strongest.key not in {v.key for v in fixed.violations}
+    # What's left is no more than chance would produce.
+    assert len(fixed.violations) <= 2 * fixed.expected_by_chance
+
+
+def test_validate_tests_unconnected_nodes():
+    df, edges = _test_file_graph()
+    connected = {e.source for e in edges} | {e.target for e in edges}
+    assert "noise" not in connected
+    with_noise = b.validate_graph(df, df.columns, edges)
+    without = b.validate_graph(df, [c for c in df.columns if c != "noise"], edges)
+    # One statement per other node: noise ⊥ y | parents(y).
+    assert with_noise.n_tests - without.n_tests == len(df.columns) - 1
+
+    empty = b.validate_graph(df, ["orders", "revenue", "noise"], [])
+    assert empty.tone == "neutral" and empty.n_tests == 3
+    assert [v.key for v in empty.violations] == [b.edge_key("orders", "revenue")]
+
+
+def test_validate_refuses_unfinished_graphs():
+    df = b.demo_table()
+    with pytest.raises(ValueError, match="dashed"):
+        b.validate_graph(df, ["price", "demand"], [b.Edge("price", "demand", False)])
+    with pytest.raises(ValueError, match="cycle"):
+        b.validate_graph(
+            df, ["price", "demand"], [b.Edge("price", "demand"), b.Edge("demand", "price")]
+        )

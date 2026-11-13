@@ -53,6 +53,10 @@ the front end. Use **Load demo data** to try it without a file.
 
 ## Using it
 
+The left panel walks through these steps in order. Each step is numbered,
+shows ✓ once done, and the current one is highlighted with a one-line
+instruction.
+
 1. **Upload** a CSV or Parquet file. Numeric columns become nodes; non-numeric
    and constant columns are ignored, and rows with missing values are dropped.
    The left panel lists exactly what was changed.
@@ -72,14 +76,22 @@ the front end. Use **Load demo data** to try it without a file.
      slope, plus the noise, degrees-of-freedom or dispersion prior the family
      uses. Empty boxes keep pathmc's defaults.
    - Edits that would create a cycle are refused.
-4. **Fit model** once every edge has a direction and the outcome has at least
+4. **Validate DAG** checks the graph against the data, with no fit needed.
+   Every independence the graph implies ("A and B are unrelated once you know
+   Z") is tested with pathmc's `test_implications`, including the ones implied
+   by unconnected nodes. `PathModel.falsify` then grades the whole graph
+   against randomly relabelled versions of itself. Violations are listed
+   strongest first, with how many to expect by chance at the chosen α. Click
+   one to highlight the pair on the graph and add an edge in either
+   direction. The check is marked out of date when the graph changes.
+5. **Fit model** once every edge has a direction and the outcome has at least
    one edge. The graph, outcome, families and priors go to pathmc's
    `BuildModelFromDAG(style="native")`, then MCMC runs (roughly 10 to 60
    seconds). The right panel shows the exact `BuildModelFromDAG(...)` call, so
    the fit can be reproduced outside the app.
-5. **Click any edge** to see its fitted relationship and the fitted equation
+6. **Click any edge** to see its fitted relationship and the fitted equation
    of its end node on the right.
-6. **Export DOT** saves the graph, with flagged items listed as comments. The
+7. **Export DOT** saves the graph, with flagged items listed as comments. The
    file can be passed straight to `pathmc.dag_to_spec`.
 
 After any structural edit, or a change of family or prior, the plot is hidden
@@ -100,8 +112,12 @@ drop zone too. Things to check:
   `ad_spend`/`season`/`v_2024_price_index` down to `revenue`. `noise` stays
   unconnected and the long `customer_satisfaction_score` label is shortened.
 - `season — store_visits` comes back dashed: orient it with **Keep direction**.
-- Discovery misses the real `v_2024_price_index → revenue` effect: add it by
-  hand, then try `revenue → ad_spend` to see the cycle check refuse it.
+- Orient the dashed edge, then **Validate DAG**: the top violation is
+  `revenue — v_2024_price_index` given `orders` (discovery missed that real
+  effect). Click it and choose **Add v_2024_price_index → revenue**; the check
+  is marked out of date. Validate again: what's left (about 2) is no more
+  than chance would flag. Try `revenue → ad_spend` to see the cycle check
+  refuse it.
 - Click a node, type a description, hover the node to see it, then
   **Export DOT** and look for the `tooltip` attribute.
 - **Fit model**, then click `orders → revenue`: the equation appears at once,
