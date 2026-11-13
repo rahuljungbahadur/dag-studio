@@ -123,6 +123,40 @@ def test_discover_recovers_demo_structure():
     assert all("promo" not in e.key and "season" not in e.key for e in sub_edges)
 
 
+def test_model_equations_from_summary():
+    import pandas as pd
+
+    rows = {
+        "beta_unit_sales[Intercept]": (0.5, 0.4, 0.6),
+        "beta_unit_sales[v_2024_price]": (-0.7, -0.8, -0.6),
+        "beta_unit_sales[promo]": (0.25, 0.1, 0.4),
+        "sigma_unit_sales": (1.1, 1.0, 1.2),
+        "mu_unit_sales[0]": (0.3, 0.2, 0.4),
+        "beta_promo[Intercept]": (0.0, -0.1, 0.1),
+    }
+    summary = pd.DataFrame(
+        list(rows.values()), index=list(rows), columns=["mean", "eti89_lb", "eti89_ub"]
+    )
+
+    class FakeModel:
+        def summary(self):
+            return summary
+
+    equations = b.model_equations(FakeModel())
+    assert set(equations) == {"unit_sales", "promo"}
+    eq = equations["unit_sales"]
+    assert [t.name for t in eq.terms] == ["v_2024_price", "promo"]
+    assert eq.interval == "89%" and equations["promo"].sigma is None
+
+    lines = eq.lines(highlight="promo")
+    assert lines == [
+        ("unit_sales = 0.500", "[0.400, 0.600]", False),
+        ("− 0.700 · v_2024_price", "[-0.800, -0.600]", False),
+        ("+ 0.250 · promo", "[0.100, 0.400]", True),
+        ("+ ε,  ε ~ Normal(0, 1.100)", "[1.000, 1.200]", False),
+    ]
+
+
 @pytest.mark.slow
 def test_fit_and_curve_recover_known_effect(monkeypatch):
     monkeypatch.setattr(b, "DRAWS", 200)
@@ -140,9 +174,14 @@ def test_fit_and_curve_recover_known_effect(monkeypatch):
     model, spec = b.fit_model(df, nodes, edges)
     assert "revenue ~ demand + price" in spec
 
-    curve = b.edge_curve(model, df, "price", "revenue")
+    equations = b.model_equations(model)
+    assert set(equations) == {"promo", "demand", "revenue"}
+    direct = next(t for t in equations["revenue"].terms if t.name == "price")
     # Direct coefficient: true value 0.4.
-    assert curve.coef_lower < 0.4 < curve.coef_upper
+    assert direct.lower < 0.4 < direct.upper
+    assert equations["revenue"].sigma.mean == pytest.approx(0.8, abs=0.15)
+
+    curve = b.edge_curve(model, df, "price", "revenue")
     # Total effect of price on revenue: 0.4 + (-0.8 * 0.9) = -0.32 per unit.
     slope = (curve.mean[-1] - curve.mean[0]) / (curve.x[-1] - curve.x[0])
     assert slope == pytest.approx(-0.32, abs=0.08)

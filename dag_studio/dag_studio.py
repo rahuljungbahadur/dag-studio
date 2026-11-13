@@ -5,7 +5,7 @@ from __future__ import annotations
 import reflex as rx
 
 from . import backend as b
-from .state import EdgeView, NodeView, State
+from .state import EdgeView, EquationRow, NodeView, State
 
 INK = "#1f2933"
 MUTED = "#7b8794"
@@ -105,7 +105,7 @@ def add_edge_section() -> rx.Component:
         ),
         rx.button("Add edge", on_click=State.add_edge, size="1", variant="soft",
                   color_scheme="gray"),
-        hint("Or click a start node, then an end node, in the graph."),
+        hint("Adding an edge between two nodes that are already connected re-points it."),
     )
 
 
@@ -247,8 +247,8 @@ def centre_panel() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             hint(
-                "Click a node to describe it, then another node to add an edge. "
-                "Click an edge to inspect it. Dashed edges have no direction yet."
+                "Click a node to describe it, or an edge to inspect it. Add edges "
+                "from the left panel. Dashed edges have no direction yet."
             ),
             rx.spacer(),
             rx.button("Tidy layout", on_click=State.tidy_layout, size="1", variant="ghost",
@@ -283,7 +283,6 @@ def node_details() -> rx.Component:
     return rx.vstack(
         label("Node"),
         rx.text(State.picked, size="3", weight="medium", color=INK),
-        hint("Click another node to draw an edge from here."),
         rx.text_area(
             value=State.picked_description,
             on_change=State.set_description,
@@ -307,7 +306,6 @@ def edge_plot() -> rx.Component:
         State.has_curve,
         rx.vstack(
             rx.plotly(data=State.fig, width="100%"),
-            rx.text(State.coef_caption, size="1", color=INK),
             hint(State.curve_caption),
             spacing="2", width="100%", align="stretch",
         ),
@@ -325,6 +323,39 @@ def edge_plot() -> rx.Component:
                     ),
                 )
             ),
+        ),
+    )
+
+
+MONO = "ui-monospace, SFMono-Regular, Menlo, monospace"
+
+
+def equation_row(row: EquationRow) -> rx.Component:
+    return rx.hstack(
+        rx.text(
+            row.expr, size="1", color=rx.cond(row.highlight, ACCENT, INK),
+            weight=rx.cond(row.highlight, "bold", "regular"),
+            style={"fontFamily": MONO, "whiteSpace": "pre"},
+        ),
+        rx.spacer(),
+        rx.text(row.band, size="1", color=MUTED, style={"fontFamily": MONO}),
+        width="100%", align="center", padding="3px 6px", border_radius="4px",
+        background=rx.cond(row.highlight, "#eff6ff", "transparent"),
+    )
+
+
+def equation_block() -> rx.Component:
+    return rx.cond(
+        State.has_equation,
+        rx.vstack(
+            label("Fitted equation"),
+            rx.vstack(
+                rx.foreach(State.equation_rows, equation_row),
+                spacing="0", width="100%", padding="4px",
+                border=f"1px solid {LINE}", border_radius="6px",
+            ),
+            hint(State.equation_caption),
+            spacing="2", width="100%", align="stretch", padding_top="6px",
         ),
     )
 
@@ -349,6 +380,7 @@ def edge_details() -> rx.Component:
             spacing="2", wrap="wrap",
         ),
         edge_plot(),
+        equation_block(),
         spacing="2", width="100%", align="stretch",
     )
 

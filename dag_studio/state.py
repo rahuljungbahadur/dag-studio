@@ -55,6 +55,15 @@ class EdgeView:
     arrow: str
 
 
+@dataclasses.dataclass
+class EquationRow:
+    """One line of a fitted equation."""
+
+    expr: str
+    band: str
+    highlight: bool  # the term for the selected edge
+
+
 def _short(name: str, limit: int = 13) -> str:
     return name if len(name) <= limit else name[: limit - 1] + "…"
 
@@ -77,7 +86,7 @@ class State(rx.State):
     descriptions: dict[str, str] = {}  # node -> free-text note written by the user
 
     # --- selection ----------------------------------------------------
-    picked: str = ""  # node clicked first; the next node click adds an edge
+    picked: str = ""  # the selected node
     selected_edge: str = ""
     new_from: str = ""  # "add edge" dropdowns
     new_to: str = ""
@@ -95,7 +104,9 @@ class State(rx.State):
     fig: go.Figure = go.Figure()
     has_curve: bool = False
     curve_caption: str = ""
-    coef_caption: str = ""
+    has_equation: bool = False
+    equation_rows: list[EquationRow] = []
+    equation_caption: str = ""
     evidence_caption: str = ""
 
     # --- feedback -----------------------------------------------------
@@ -163,7 +174,7 @@ class State(rx.State):
         """Call after any structural edit: the fitted model no longer matches."""
         if self.fitted:
             self.stale = True
-        self.has_curve = False
+        self.has_curve = self.has_equation = False
         self.error = ""
 
     def _reset_graph(self) -> None:
@@ -171,8 +182,8 @@ class State(rx.State):
         self.flagged_nodes, self.flagged_edges = [], []
         self.positions, self.descriptions = {}, {}
         self.picked = self.selected_edge = ""
-        self.fitted = self.stale = self.has_curve = False
-        self.spec = self.curve_caption = self.coef_caption = self.evidence_caption = ""
+        self.fitted = self.stale = self.has_curve = self.has_equation = False
+        self.spec = self.curve_caption = self.equation_caption = self.evidence_caption = ""
         session = self._session()
         session.pop("model", None)
         session["evidence"], session["curves"] = {}, {}
@@ -309,7 +320,7 @@ class State(rx.State):
             self.edges = [dataclasses.asdict(e) for e in edges]
             self.flagged_edges = []
             self.picked = self.selected_edge = ""
-            self.fitted = self.stale = self.has_curve = False
+            self.fitted = self.stale = self.has_curve = self.has_equation = False
             self.evidence_caption = ""
             self._refresh(relayout=True)
             self.busy = ""
@@ -332,15 +343,13 @@ class State(rx.State):
 
     @rx.event
     def click_node(self, node: str):
-        """First click picks a start node; clicking a second node adds the edge."""
+        """Select a node, or deselect it if it is already selected.
+
+        Clicking nodes never adds edges; use the "Add edge" dropdowns for that.
+        """
         self.error = ""
-        if not self.picked:
-            self.picked, self.selected_edge = node, ""
-        elif self.picked == node:
-            self.picked = ""
-        else:
-            self._put_edge(self.picked, node)
-            self.picked = ""
+        self.picked = "" if self.picked == node else node
+        self.selected_edge = ""
         self._refresh()
         return State.show_selected_edge
 
@@ -371,7 +380,7 @@ class State(rx.State):
     @rx.event
     def clear_selection(self):
         self.picked = self.selected_edge = ""
-        self.has_curve = False
+        self.has_curve = self.has_equation = False
         self._refresh()
 
     @rx.event
@@ -492,12 +501,14 @@ class State(rx.State):
             session, nodes, edges = self._session(), list(self.nodes), self._edge_objects()
         try:
             model, spec = await asyncio.to_thread(b.fit_model, session["df"], nodes, edges)
+            equations = await asyncio.to_thread(b.model_equations, model)
         except Exception as exc:  # noqa: BLE001
             async with self:
                 self.busy, self.error = "", f"Fit failed: {exc}"
             return
         async with self:
             session["model"], session["curves"] = model, {}
+            session["equations"] = equations
             self.fitted, self.stale, self.spec, self.busy = True, False, spec, ""
         return State.show_selected_edge
 
@@ -514,11 +525,24 @@ class State(rx.State):
             edge = next(
                 (e for e in self.edges if b.edge_key(e["source"], e["target"]) == key), None
             )
-            self.has_curve = False
+            self.has_curve = self.has_equation = False
             ready = edge and edge["directed"] and self.fitted and not self.stale
-            if not ready or self.busy:
+            if not ready:
                 return
             source, target = edge["source"], edge["target"]
+            equation = session.get("equations", {}).get(target)
+            if equation:
+                self.equation_rows = [
+                    EquationRow(expr, band, hit) for expr, band, hit in equation.lines(source)
+                ]
+                self.equation_caption = (
+                    f"Posterior means, with {equation.interval} intervals on the right. "
+                    f"The highlighted term is the direct effect of {source}; the curve "
+                    "above is the total effect through every path."
+                )
+                self.has_equation = True
+            if self.busy:
+                return
             cached = session["curves"].get((source, target))
             if not cached:
                 self.busy = f"Computing E[{target} | do({source})]…"
@@ -543,10 +567,5 @@ class State(rx.State):
             self.curve_caption = (
                 f"Total effect: posterior mean of {target} when {source} is set to x, "
                 f"with a {level}% credible band. Grey points are the observed data."
-            )
-            self.coef_caption = (
-                f"Direct coefficient {source} → {target}: {cached.coef_mean:.3f} "
-                f"({cached.coef_interval} interval {cached.coef_lower:.3f} to "
-                f"{cached.coef_upper:.3f})"
             )
             self.has_curve = True

@@ -461,10 +461,87 @@ class Curve:
     mean: list[float]
     lower: list[float]
     upper: list[float]
-    coef_mean: float
-    coef_lower: float
-    coef_upper: float
-    coef_interval: str
+
+
+@dataclass
+class Term:
+    """One posterior summary: mean and equal-tailed interval."""
+
+    name: str  # "Intercept" or the parent node
+    mean: float
+    lower: float
+    upper: float
+
+
+@dataclass
+class Equation:
+    """The fitted structural equation of one node.
+
+    ``node = intercept + sum(coef * parent) + noise``, noise ~ Normal(0, sigma).
+    """
+
+    node: str
+    intercept: Term
+    terms: list[Term]  # one per parent, in the order pathmc reports them
+    sigma: Term | None
+    interval: str  # e.g. "89%"
+
+    def lines(self, highlight: str = "") -> list[tuple[str, str, bool]]:
+        """Display rows: (expression, interval, is the ``highlight`` parent's term)."""
+
+        def band(t: Term) -> str:
+            return f"[{t.lower:.3f}, {t.upper:.3f}]"
+
+        rows = [(f"{self.node} = {self.intercept.mean:.3f}", band(self.intercept), False)]
+        for t in self.terms:
+            sign = "−" if t.mean < 0 else "+"
+            rows.append((f"{sign} {abs(t.mean):.3f} · {t.name}", band(t), t.name == highlight))
+        if self.sigma is not None:
+            rows.append(
+                (f"+ ε,  ε ~ Normal(0, {self.sigma.mean:.3f})", band(self.sigma), False)
+            )
+        return rows
+
+
+def _interval_columns(summary) -> tuple[str, str, str]:
+    bounds = [c for c in summary.columns if c.startswith(("eti", "hdi"))]
+    lb = next(c for c in bounds if c.endswith("lb"))
+    ub = next(c for c in bounds if c.endswith("ub"))
+    return lb, ub, f"{re.sub(r'[^0-9]', '', lb) or '?'}%"
+
+
+def model_equations(model) -> dict[str, Equation]:
+    """Fitted equation for every node that has parents, from pathmc's summary.
+
+    Reads the ``beta_<node>[<parent or Intercept>]`` and ``sigma_<node>`` rows.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        summary = model.summary()
+    lb, ub, level = _interval_columns(summary)
+
+    def term(name: str, label: str) -> Term:
+        row = summary.loc[name]
+        return Term(label, float(row["mean"]), float(row[lb]), float(row[ub]))
+
+    coefs: dict[str, list[Term]] = {}
+    for name in summary.index:
+        match = re.fullmatch(r"beta_(.+)\[(.+)\]", str(name))
+        if match:
+            coefs.setdefault(match[1], []).append(term(name, match[2]))
+
+    equations = {}
+    for node, terms in coefs.items():
+        intercept = next((t for t in terms if t.name == "Intercept"), Term("Intercept", 0, 0, 0))
+        sigma = f"sigma_{node}"
+        equations[node] = Equation(
+            node=node,
+            intercept=intercept,
+            terms=[t for t in terms if t.name != "Intercept"],
+            sigma=term(sigma, "sigma") if sigma in summary.index else None,
+            interval=level,
+        )
+    return equations
 
 
 def edge_curve(model, df: pl.DataFrame, source: str, target: str) -> Curve:
@@ -472,7 +549,7 @@ def edge_curve(model, df: pl.DataFrame, source: str, target: str) -> Curve:
 
     Uses pathmc's ``do()`` (g-computation), so the curve is the *total* effect
     of ``source`` on ``target`` through every directed path in the fitted DAG.
-    The direct-edge coefficient is reported alongside it.
+    The direct effect is the ``source`` term in :func:`model_equations`.
     """
     lo_q, hi_q = (1 - INTERVAL) / 2, 1 - (1 - INTERVAL) / 2
     values = df[source].to_numpy()
@@ -486,13 +563,6 @@ def edge_curve(model, df: pl.DataFrame, source: str, target: str) -> Curve:
             mean.append(float(draws.mean()))
             lower.append(float(np.quantile(draws, lo_q)))
             upper.append(float(np.quantile(draws, hi_q)))
-        summary = model.summary()
-
-    row = summary.loc[f"beta_{target}[{source}]"]
-    bounds = [c for c in summary.columns if c.startswith(("eti", "hdi"))]
-    lb = next(c for c in bounds if c.endswith("lb"))
-    ub = next(c for c in bounds if c.endswith("ub"))
-    level = re.sub(r"\D", "", lb) or "?"
     return Curve(
         source=source,
         target=target,
@@ -500,10 +570,6 @@ def edge_curve(model, df: pl.DataFrame, source: str, target: str) -> Curve:
         mean=mean,
         lower=lower,
         upper=upper,
-        coef_mean=float(row["mean"]),
-        coef_lower=float(row[lb]),
-        coef_upper=float(row[ub]),
-        coef_interval=f"{level}%",
     )
 
 
