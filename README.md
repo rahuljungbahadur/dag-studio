@@ -89,6 +89,13 @@ instruction.
    `BuildModelFromDAG(style="native")`, then MCMC runs (roughly 10 to 60
    seconds). The right panel shows the exact `BuildModelFromDAG(...)` call, so
    the fit can be reproduced outside the app.
+
+   **Fit quality** appears beside it: sampler diagnostics (4 chains; largest
+   r̂, smallest effective sample size, divergences, with a warning when the
+   fit should not be trusted) and each node's **Bayesian R²** (Gelman et al.,
+   2019): the share of its variance its parents explain, with an 89%
+   interval. R² measures prediction, not causal correctness; use Validate DAG
+   for the graph.
 6. **Click any edge** to see its fitted relationship and the fitted equation
    of its end node on the right.
    After a fit, each edge is coloured by the sign of its direct coefficient:

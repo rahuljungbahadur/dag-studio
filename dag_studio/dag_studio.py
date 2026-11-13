@@ -5,7 +5,7 @@ from __future__ import annotations
 import reflex as rx
 
 from . import backend as b
-from .state import EdgeView, EquationRow, NodeView, PriorRow, State, ViolationView
+from .state import EdgeView, EquationRow, NodeView, PriorRow, R2Row, State, ViolationView
 
 INK = "#1f2933"
 MUTED = "#7b8794"
@@ -457,6 +457,10 @@ def node_details() -> rx.Component:
     return rx.vstack(
         label("Node"),
         rx.text(State.picked, size="3", weight="medium", color=INK),
+        rx.cond(
+            State.picked_r2 != "",
+            hint(State.picked_r2, " of this node's variance is explained by its parents."),
+        ),
         rx.text_area(
             value=State.picked_description,
             on_change=State.set_description,
@@ -558,6 +562,54 @@ def edge_details() -> rx.Component:
     )
 
 
+def r2_row(row: R2Row) -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.text(row.node, size="1", color=INK,
+                    weight=rx.cond(row.is_target, "bold", "regular")),
+            rx.cond(row.family != "", rx.text(row.family, size="1", color=MUTED)),
+            rx.spacer(),
+            rx.text(row.r2, size="1", color=INK, style={"fontFamily": MONO}),
+            rx.text(row.interval, size="1", color=MUTED, style={"fontFamily": MONO}),
+            width="100%", align="center", spacing="2",
+        ),
+        rx.box(
+            rx.box(height="100%", width=row.bar, background=ACCENT, border_radius="2px"),
+            height="4px", width="100%", background=LINE, border_radius="2px",
+        ),
+        spacing="1", width="100%",
+    )
+
+
+def fit_quality_section() -> rx.Component:
+    return rx.cond(
+        State.shows_effects,
+        rx.vstack(
+            label("Fit quality"),
+            hint(State.fit_diagnostics),
+            rx.cond(
+                State.fit_warnings.length() > 0,
+                rx.foreach(
+                    State.fit_warnings,
+                    lambda w: rx.text(w, size="1", line_height="1.5",
+                                      color=rx.cond(State.fit_trouble, RED, AMBER)),
+                ),
+                hint("The sampler converged: these estimates can be trusted as fits.",
+                     color=GREEN),
+            ),
+            rx.text("Variance explained by each node's parents (Bayesian R², 89% interval)",
+                    size="1", color=INK, padding_top="4px"),
+            rx.foreach(State.r2_rows, r2_row),
+            hint(
+                "R² says how well the parents predict a node, not whether the graph is causally "
+                "right: a well-identified effect can sit in a noisy outcome, and a wrong graph "
+                "can predict well. Use Validate DAG for the graph."
+            ),
+            spacing="2", width="100%", align="stretch",
+        ),
+    )
+
+
 def right_panel() -> rx.Component:
     return rx.vstack(
         rx.cond(
@@ -573,6 +625,7 @@ def right_panel() -> rx.Component:
                 ),
             ),
         ),
+        fit_quality_section(),
         rx.cond(
             State.fitted,
             rx.vstack(

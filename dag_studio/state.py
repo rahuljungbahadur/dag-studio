@@ -72,6 +72,18 @@ class EquationRow:
 
 
 @dataclasses.dataclass
+class R2Row:
+    """One node's Bayesian R² in the Fit quality table."""
+
+    node: str
+    family: str
+    r2: str
+    interval: str
+    bar: str  # CSS width of the bar, e.g. "76%"
+    is_target: bool
+
+
+@dataclasses.dataclass
 class ViolationView:
     """One violated independence in the Validate step."""
 
@@ -155,6 +167,11 @@ class State(rx.State):
     stale: bool = False  # graph edited since the last fit
     spec: str = ""
     fit_code: str = ""  # the BuildModelFromDAG call behind the current fit
+    r2_rows: list[R2Row] = []
+    fit_diagnostics: str = ""
+    fit_warnings: list[str] = []
+    fit_trouble: bool = False  # r̂ above RHAT_BAD: the fit should not be trusted
+    _r2_text: dict[str, str] = {}  # node -> "0.76 [0.73, 0.78]"
     fig: go.Figure = go.Figure()
     has_curve: bool = False
     curve_caption: str = ""
@@ -420,6 +437,11 @@ class State(rx.State):
             )
             seen.add(p.prefix)
         return rows
+
+    @rx.var
+    def picked_r2(self) -> str:
+        text = self._r2_text.get(self.picked, "")
+        return f"R² = {text}" if text and self.fitted and not self.stale else ""
 
     @rx.var
     def picked_description(self) -> str:
@@ -788,21 +810,44 @@ class State(rx.State):
             target, families = self.target, dict(self.families)
             priors = {n: dict(v) for n, v in self.prior_text.items()}
         try:
-            model, spec, code = await asyncio.to_thread(
+            fit = await asyncio.to_thread(
                 b.fit_model, session["df"], nodes, edges, target, families, priors
             )
-            equations = await asyncio.to_thread(b.model_equations, model, families)
+            equations = await asyncio.to_thread(b.model_equations, fit.model, families)
+            quality = await asyncio.to_thread(b.fit_quality, fit)
         except Exception as exc:  # noqa: BLE001
             async with self:
                 self.busy, self.error = "", f"Fit failed: {exc}"
             return
         async with self:
-            session["model"], session["curves"] = model, {}
+            session["model"], session["curves"] = fit.model, {}
             session["equations"] = equations
-            self.fitted, self.stale, self.spec, self.busy = True, False, spec, ""
-            self.fit_code = code
+            self.fitted, self.stale, self.spec, self.busy = True, False, fit.spec, ""
+            self.fit_code = fit.code
+            self._set_quality(quality, target)
             self._refresh()
         return State.show_selected_edge
+
+    def _set_quality(self, quality: "b.FitQuality", target: str) -> None:
+        nodes = sorted(quality.nodes, key=lambda n: (n.node != target, n.node))
+        self.r2_rows = [
+            R2Row(
+                node=n.node,
+                family="" if n.family == "gaussian" else n.family,
+                r2=f"{n.r2:.2f}",
+                interval=f"[{n.lower:.2f}, {n.upper:.2f}]",
+                bar=f"{max(n.r2, 0) * 100:.0f}%",
+                is_target=n.node == target,
+            )
+            for n in nodes
+        ]
+        self._r2_text = {n.node: f"{n.r2:.2f} [{n.lower:.2f}, {n.upper:.2f}]" for n in nodes}
+        self.fit_diagnostics = (
+            f"{b.CHAINS} chains × {b.DRAWS} draws · largest r̂ {quality.max_rhat:.3f} · "
+            f"smallest ESS {quality.min_ess:.0f} · {quality.divergences} divergences"
+        )
+        self.fit_warnings = quality.warnings()
+        self.fit_trouble = not quality.max_rhat < b.RHAT_BAD or quality.divergences > 0
 
     @rx.event(background=True)
     async def show_selected_edge(self):
@@ -832,6 +877,10 @@ class State(rx.State):
                     f"The highlighted term is the direct effect of {source}; the curve "
                     "above is the total effect through every path."
                 )
+                if target in self._r2_text:
+                    self.equation_caption += (
+                        f" Its parents explain R² = {self._r2_text[target]} of {target}'s variance."
+                    )
                 self.has_equation = True
             if self.busy:
                 return

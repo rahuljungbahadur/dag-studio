@@ -172,9 +172,8 @@ def test_fit_and_curve_recover_known_effect(monkeypatch):
         b.Edge("demand", "revenue"),
         b.Edge("price", "revenue"),
     ]
-    model, spec, code = b.fit_model(
-        df, nodes, edges, "revenue", priors={"revenue": {"beta.sigma": "5"}}
-    )
+    fit = b.fit_model(df, nodes, edges, "revenue", priors={"revenue": {"beta.sigma": "5"}})
+    model, spec, code = fit.model, fit.spec, fit.code
     assert code.startswith("builder = BuildModelFromDAG(") and 'target="revenue"' in code
     assert '"beta_revenue": Prior("Normal", mu=0, sigma=5),' in code
     assert "revenue ~ demand + price" in spec
@@ -194,6 +193,17 @@ def test_fit_and_curve_recover_known_effect(monkeypatch):
 
     fig = b.make_figure(curve, df)
     assert len(fig.data) == 3
+
+    # Bayesian R² for a gaussian node matches ordinary least squares.
+    quality = b.fit_quality(fit)
+    r2 = {n.node: n for n in quality.nodes}
+    assert set(r2) == {"promo", "demand", "revenue"}
+    X = np.column_stack([np.ones(df.height), df["demand"].to_numpy(), df["price"].to_numpy()])
+    y = df["revenue"].to_numpy()
+    resid = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+    assert r2["revenue"].r2 == pytest.approx(1 - resid.var() / y.var(), abs=0.02)
+    assert r2["revenue"].lower < r2["revenue"].r2 < r2["revenue"].upper
+    assert quality.divergences == 0 and quality.max_rhat < b.RHAT_BAD
 
 
 def test_fit_refuses_invalid_graph():
@@ -289,9 +299,8 @@ def test_bernoulli_fit_through_builder(monkeypatch):
     df = pl.DataFrame({"x": x, "m": m, "y": y})
     edges = [b.Edge("x", "m"), b.Edge("m", "y"), b.Edge("x", "y")]
     families = {"y": "bernoulli"}
-    model, _, code = b.fit_model(
-        df, ["x", "m", "y"], edges, "y", families, {"y": {"beta.sigma": "2"}}
-    )
+    fit = b.fit_model(df, ["x", "m", "y"], edges, "y", families, {"y": {"beta.sigma": "2"}})
+    model, code = fit.model, fit.code
     assert 'families={"y": "bernoulli"},' in code
 
     equations = b.model_equations(model, families)
@@ -303,6 +312,9 @@ def test_bernoulli_fit_through_builder(monkeypatch):
     curve = b.edge_curve(model, df, "x", "y")
     assert all(0 <= v <= 1 for v in curve.mean)  # a probability
     assert curve.mean[-1] > curve.mean[0]
+
+    quality = {n.node: n for n in b.fit_quality(fit).nodes}
+    assert quality["y"].family == "bernoulli" and 0.05 < quality["y"].r2 < 0.6
 
 
 def _test_file_graph():
@@ -376,3 +388,34 @@ def test_edge_effects_sign_and_uncertainty():
     }
     assert set(signs.values()) <= set(b.EFFECT_COLOURS)
     assert b.EFFECT_COLOURS["pos"] == "#008FD5" and b.EFFECT_COLOURS["neg"] == "#FC4F30"
+
+
+def _fake_idata(**posterior):
+    """Just enough of a DataTree for bayes_r2: one chain of each variable."""
+    return {"posterior": {k: np.asarray(v)[None] for k, v in posterior.items()},
+            "observed_data": {}}
+
+
+def test_bayes_r2_by_family():
+    mean = np.array([[0.0, 1.0, 2.0, 3.0]] * 2)  # 2 draws, 4 rows; var = 5/3
+    gaussian = b.bayes_r2(_fake_idata(mu_y=mean, sigma_y=[1.0, 2.0]), "y")
+    assert gaussian == pytest.approx([(5 / 3) / (5 / 3 + 1), (5 / 3) / (5 / 3 + 4)])
+
+    p = np.array([[0.2, 0.8, 0.2, 0.8]])
+    bern = b.bayes_r2(_fake_idata(pathmc_resp_y=p), "y", "bernoulli")
+    assert bern == pytest.approx([0.12 / (0.12 + 0.16)])  # var(p) / (var(p) + mean p(1-p))
+
+    lam = np.array([[1.0, 3.0]])
+    pois = b.bayes_r2(_fake_idata(pathmc_resp_y=lam), "y", "poisson")
+    assert pois == pytest.approx([2.0 / (2.0 + 2.0)])
+    nb = b.bayes_r2(_fake_idata(pathmc_resp_y=lam, alpha_disp_y=[2.0]), "y", "negbinomial")
+    assert nb == pytest.approx([2.0 / (2.0 + (2.0 + 5.0 / 2))])  # mean(mu + mu²/alpha)
+
+
+def test_fit_quality_warning_levels():
+    good = b.FitQuality([], max_rhat=1.004, min_ess=900, divergences=0)
+    assert good.warnings() == []
+    borderline = b.FitQuality([], max_rhat=1.02, min_ess=900, divergences=0).warnings()
+    assert len(borderline) == 1 and borderline[0].startswith("Borderline")
+    bad = b.FitQuality([], max_rhat=1.2, min_ess=50, divergences=3).warnings()
+    assert len(bad) == 3 and bad[0].startswith("The chains disagree")

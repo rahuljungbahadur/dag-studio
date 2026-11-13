@@ -23,7 +23,7 @@ import polars as pl
 
 BF_THRESHOLD = 1.0  # TBFPC: declare independence when BF10 < this
 MAX_CONDITIONING_SET = 3  # TBFPC: largest conditioning set searched
-DRAWS, TUNE, CHAINS = 500, 500, 2  # MCMC budget for one fit
+DRAWS, TUNE, CHAINS = 500, 500, 4  # MCMC budget for one fit (4 chains for a reliable r̂)
 INTERVAL = 0.89  # equal-tailed credible interval used everywhere
 GRID_POINTS = 15  # x values on the fitted-relationship curve
 MAX_SCATTER = 600  # observed points drawn behind the curve
@@ -727,8 +727,7 @@ def fit_model(
     ``families`` maps node -> family and ``priors`` maps node -> the numbers
     typed in the UI (see :func:`prior_specs`). Settings for nodes without
     parents, and "gaussian" (the default), are left out of the call.
-    Returns ``(model, spec, code)``: the fitted PathModel, its pathmc spec and
-    the equivalent ``BuildModelFromDAG`` call.
+    Returns a :class:`FitResult`.
     """
     import pathmc
     from pymc_extras.prior import Prior
@@ -763,14 +762,139 @@ def fit_model(
     spec = pathmc.dag_to_spec(dag)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model.fit(
+        idata = model.fit(
             draws=DRAWS,
             tune=TUNE,
             chains=CHAINS,
             progressbar=False,
             random_seed=RANDOM_SEED,
         )
-    return model, spec, builder_code(dag, target, families, specs)
+    return FitResult(model, idata, spec, builder_code(dag, target, families, specs), families)
+
+
+@dataclass
+class FitResult:
+    model: object  # pathmc.PathModel
+    idata: object  # the posterior DataTree returned by PathModel.fit
+    spec: str
+    code: str  # the equivalent BuildModelFromDAG call
+    families: dict[str, str]  # non-gaussian families actually used
+
+
+# --------------------------------------------------------------------------
+# Fit quality: Bayesian R² per node and sampler diagnostics
+# --------------------------------------------------------------------------
+
+# Vehtari et al. (2021): r̂ < 1.01 and bulk ESS >= 400. Between 1.01 and 1.05 is
+# usually tail noise on a short run; above 1.05 the chains genuinely disagree.
+RHAT_GOOD, RHAT_BAD, ESS_MIN = 1.01, 1.05, 400
+
+
+@dataclass
+class NodeFit:
+    """Share of a node's variance explained by its parents (Bayesian R²)."""
+
+    node: str
+    family: str
+    r2: float  # posterior median
+    lower: float  # equal-tailed INTERVAL bounds
+    upper: float
+
+
+@dataclass
+class FitQuality:
+    nodes: list[NodeFit]
+    max_rhat: float
+    min_ess: float
+    divergences: int
+
+    def warnings(self) -> list[str]:
+        """Sampler problems, worst first. Empty means the fit can be trusted."""
+        out = []
+        if not self.max_rhat < RHAT_BAD:
+            out.append(
+                f"The chains disagree (largest r̂ {self.max_rhat:.3f}), so the sampler has not "
+                "converged. Don't trust this fit; try stronger priors or more draws."
+            )
+        elif not self.max_rhat < RHAT_GOOD:
+            out.append(
+                f"Borderline convergence (largest r̂ {self.max_rhat:.3f}, ideally below "
+                f"{RHAT_GOOD}). Usually harmless on a short run; more draws would confirm it."
+            )
+        if not self.min_ess >= ESS_MIN:
+            out.append(
+                f"Too few effective draws (smallest ESS {self.min_ess:.0f}, should be "
+                f"{ESS_MIN}+). Raise DRAWS in backend.py."
+            )
+        if self.divergences:
+            out.append(
+                f"{self.divergences} divergent transitions: the sampler struggled, so "
+                "estimates may be biased. Stronger priors often help."
+            )
+        return out
+
+
+def _draws(posterior, name: str) -> np.ndarray:
+    """Stack chains: (chain, draw, ...) -> (sample, ...)."""
+    values = np.asarray(posterior[name])
+    return values.reshape(-1, *values.shape[2:])
+
+
+def bayes_r2(idata, node: str, family: str = "gaussian") -> np.ndarray:
+    """Bayesian R² draws for one node (Gelman, Goodrich, Gabry & Vehtari, 2019).
+
+    Per posterior draw: var(fitted means) / (var(fitted means) + residual
+    variance). The residual variance comes from the family: sigma² (gaussian),
+    p(1 - p) (bernoulli), lambda (poisson), mu + mu²/alpha (negbinomial). For
+    studentt, whose sigma is not a variance, the observed residuals are used.
+    """
+    post = idata["posterior"]
+    count_like = family in ("bernoulli", "poisson", "negbinomial")
+    mean = _draws(post, f"pathmc_resp_{node}" if count_like else f"mu_{node}")
+    var_fit = mean.var(axis=1, ddof=1)
+    if family == "gaussian":
+        var_res = _draws(post, f"sigma_{node}") ** 2
+    elif family == "bernoulli":
+        var_res = (mean * (1 - mean)).mean(axis=1)
+    elif family == "poisson":
+        var_res = mean.mean(axis=1)
+    elif family == "negbinomial":
+        alpha = _draws(post, f"alpha_disp_{node}")
+        var_res = (mean + mean**2 / alpha[:, None]).mean(axis=1)
+    else:
+        observed = np.asarray(idata["observed_data"][node], dtype=float)
+        var_res = (observed[None, :] - mean).var(axis=1, ddof=1)
+    return var_fit / (var_fit + var_res)
+
+
+def fit_quality(fit: FitResult) -> FitQuality:
+    """R² for every node with parents, plus r̂, ESS and divergences."""
+    post = fit.idata["posterior"]
+    nodes = sorted(
+        name[len("mu_"):] for name in post.data_vars if str(name).startswith("mu_")
+    )
+    lo_q, hi_q = (1 - INTERVAL) / 2, 1 - (1 - INTERVAL) / 2
+    node_fits = []
+    for node in nodes:
+        family = fit.families.get(node, "gaussian")
+        draws = bayes_r2(fit.idata, node, family)
+        node_fits.append(
+            NodeFit(node, family, float(np.median(draws)),
+                    float(np.quantile(draws, lo_q)), float(np.quantile(draws, hi_q)))
+        )
+
+    import arviz as az
+
+    # Only the model's parameters: the per-row means are functions of them.
+    ds = post.to_dataset()
+    ds = ds[[v for v in ds.data_vars if not str(v).startswith(("mu_", "pathmc_resp_"))]]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rhat, ess = az.rhat(ds), az.ess(ds, method="bulk")
+    max_rhat = max(float(rhat[v].max()) for v in rhat.data_vars)
+    min_ess = min(float(ess[v].min()) for v in ess.data_vars)
+    divergences = int(np.asarray(fit.idata["sample_stats"]["diverging"]).sum())
+    return FitQuality(node_fits, max_rhat, min_ess, divergences)
 
 
 @dataclass
