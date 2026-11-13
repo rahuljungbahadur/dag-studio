@@ -128,18 +128,9 @@ def edit_step() -> rx.Component:
     return step(
         3, "Review and edit",
         "Use what you know about the domain: give every dashed edge a direction, and add, "
-        "reverse or delete edges. Click a node to describe it or set its model.",
+        "reverse or delete edges. To add one, ⌘-click two nodes in the graph, then press Add "
+        "edge. Click a node to describe it or set its model.",
         rx.foreach(State.problems, lambda p: hint("• ", p, color=AMBER)),
-        rx.grid(
-            rx.select(State.nodes, value=State.new_from, on_change=State.set_new_from,
-                      placeholder="from", size="1"),
-            rx.select(State.nodes, value=State.new_to, on_change=State.set_new_to,
-                      placeholder="to", size="1"),
-            columns="2", gap="8px", width="100%",
-        ),
-        rx.button("Add edge", on_click=State.add_edge, size="1", variant="soft",
-                  color_scheme="gray"),
-        hint("Adding an edge between two connected nodes re-points it."),
         rx.cond(
             State.removed.length() > 0,
             rx.vstack(
@@ -324,7 +315,7 @@ def node_el(n: NodeView) -> rx.Component:
             ),
         ),
         rx.el.svg.title(n.tooltip),
-        on_click=State.click_node(n.id), cursor="pointer",
+        on_click=lambda e: State.click_node(n.id, e), cursor="pointer",
         opacity=rx.cond(n.dimmed, "0.3", "1"),
     )
 
@@ -372,18 +363,39 @@ def graph_canvas() -> rx.Component:
     )
 
 
+def edge_toolbar() -> rx.Component:
+    """Add an edge between the two nodes selected with ⌘-click."""
+    return rx.hstack(
+        rx.button(
+            State.add_edge_label, on_click=State.add_selected_edge,
+            disabled=~State.two_selected, size="1", variant="soft", color_scheme="blue",
+        ),
+        rx.button(
+            "⇄", on_click=State.swap_selected, disabled=~State.two_selected,
+            size="1", variant="ghost", color_scheme="gray", title="Swap direction",
+        ),
+        rx.cond(
+            State.two_selected,
+            hint("The edge runs from the node you picked first to the second."),
+            hint("⌘-click (Ctrl-click on Windows) two nodes to enable."),
+        ),
+        spacing="2", align="center", width="100%", wrap="wrap",
+    )
+
+
 def centre_panel() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             hint(
                 "Click a node to highlight its connections and describe it, or an edge to "
-                "inspect it. Add edges from the left panel. Dashed edges have no direction yet."
+                "inspect it. Dashed edges have no direction yet."
             ),
             rx.spacer(),
             rx.button("Tidy layout", on_click=State.tidy_layout, size="1", variant="ghost",
                       color_scheme="gray"),
             width="100%", align="center",
         ),
+        rx.cond(State.has_data, edge_toolbar()),
         effect_legend(),
         rx.cond(
             State.has_data,
@@ -616,12 +628,24 @@ def right_panel() -> rx.Component:
             State.picked != "",
             node_details(),
             rx.cond(
-                State.selected_edge != "",
-                edge_details(),
+                State.two_selected,
                 rx.vstack(
-                    label("Selection"),
-                    hint("Select a node or an edge in the graph."),
-                    spacing="2",
+                    label("Two nodes selected"),
+                    rx.text(State.pair_label, size="3", weight="medium", color=INK),
+                    hint(
+                        "Press Add edge above the graph to connect them, or ⇄ to swap the "
+                        "direction. Click a single node to describe it or set its model."
+                    ),
+                    spacing="2", width="100%", align="stretch",
+                ),
+                rx.cond(
+                    State.selected_edge != "",
+                    edge_details(),
+                    rx.vstack(
+                        label("Selection"),
+                        hint("Select a node or an edge in the graph."),
+                        spacing="2",
+                    ),
                 ),
             ),
         ),

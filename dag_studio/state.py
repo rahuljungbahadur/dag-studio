@@ -139,10 +139,8 @@ class State(rx.State):
     prior_text: dict[str, dict[str, str]] = {}  # node -> {PriorParam.key -> typed text}
 
     # --- selection ----------------------------------------------------
-    picked: str = ""  # the selected node
+    selected_nodes: list[str] = []  # in the order picked; cmd-click adds a second (max 2)
     selected_edge: str = ""
-    new_from: str = ""  # "add edge" dropdowns
-    new_to: str = ""
 
     # --- derived views for rendering ----------------------------------
     node_views: list[NodeView] = []
@@ -210,9 +208,9 @@ class State(rx.State):
         width, height = b.canvas_size(pos)
         self.canvas_w, self.canvas_h = int(width), int(height)
 
-        picked = self.picked
-        neighbours = {e.target for e in edges if e.source == picked} | {
-            e.source for e in edges if e.target == picked
+        chosen_nodes = set(self.selected_nodes)
+        neighbours = {e.target for e in edges if e.source in chosen_nodes} | {
+            e.source for e in edges if e.target in chosen_nodes
         }
         effects = (
             b.edge_effects(self._session().get("equations", {}), edges)
@@ -232,13 +230,13 @@ class State(rx.State):
                 dot_y=f"{pos[n][1] - b.NODE_H / 2 + 2:.1f}",
                 note_x=f"{pos[n][0] - b.NODE_W / 2 + 2:.1f}",
                 flagged=n in self.flagged_nodes,
-                picked=n == self.picked,
+                picked=n in chosen_nodes,
                 is_target=n == self.target,
                 tooltip=f"{n}\n{self.descriptions[n]}" if self.descriptions.get(n) else n,
                 described=bool(self.descriptions.get(n, "").strip()),
                 hinted=n in hinted,
                 neighbour=n in neighbours,
-                dimmed=bool(picked) and n != picked and n not in neighbours,
+                dimmed=bool(chosen_nodes) and n not in chosen_nodes and n not in neighbours,
             )
             for n in self.nodes
         ]
@@ -265,7 +263,7 @@ class State(rx.State):
             others = [p for n, p in pos.items() if n not in (e.source, e.target)]
             d, arrow = b.edge_geometry(pos[e.source], pos[e.target], e.directed, others)
             selected = e.key == self.selected_edge
-            incident = picked in (e.source, e.target)
+            incident = e.source in chosen_nodes or e.target in chosen_nodes
             sign, term = effects.get(e.key, ("", None))
             if sign:
                 colour = b.EFFECT_COLOURS[sign]  # the fitted sign wins over highlight colours
@@ -294,7 +292,7 @@ class State(rx.State):
                     arrow=arrow,
                     colour=colour,
                     width="3" if selected or incident else ("2.2" if sign else "1.5"),
-                    opacity="0.2" if picked and not incident else "1",
+                    opacity="0.2" if chosen_nodes and not incident else "1",
                     tooltip=tooltip,
                 )
             )
@@ -314,7 +312,7 @@ class State(rx.State):
         self.families, self.prior_text = {}, {}
         self._violations, self.validated_sig, self.selected_violation = [], "", ""
         self.verdict = self.verdict_detail = self.violation_summary = ""
-        self.picked = self.selected_edge = ""
+        self.selected_nodes, self.selected_edge = [], ""
         self.fitted = self.stale = self.has_curve = self.has_equation = False
         self.curve_caption = self.equation_caption = self.evidence_caption = ""
         session = self._session()
@@ -327,7 +325,6 @@ class State(rx.State):
         self.filename, self.n_rows = filename, df.height
         self.columns, self.notes = df.columns, notes
         self.target = target or df.columns[-1]
-        self.new_from = self.new_to = ""
         self.error = ""
         self._reset_graph()
 
@@ -370,6 +367,29 @@ class State(rx.State):
     @rx.var
     def selected_edge_flagged(self) -> bool:
         return self.selected_edge in self.flagged_edges
+
+    @rx.var
+    def picked(self) -> str:
+        """The selected node when exactly one is selected, else empty."""
+        return self.selected_nodes[0] if len(self.selected_nodes) == 1 else ""
+
+    @rx.var
+    def two_selected(self) -> bool:
+        return len(self.selected_nodes) == 2
+
+    @rx.var
+    def pair_label(self) -> str:
+        return " → ".join(self.selected_nodes) if len(self.selected_nodes) == 2 else ""
+
+    @rx.var
+    def add_edge_label(self) -> str:
+        if len(self.selected_nodes) != 2:
+            return "Add edge"
+        a, b_ = self.selected_nodes
+        exists = any(
+            b.edge_key(e["source"], e["target"]) == b.edge_key(a, b_) for e in self.edges
+        )
+        return f"{'Re-point to' if exists else 'Add edge'} {a} → {b_}"
 
     @rx.var
     def picked_flagged(self) -> bool:
@@ -519,7 +539,7 @@ class State(rx.State):
             session.pop("model", None)
             self.edges = [dataclasses.asdict(e) for e in edges]
             self.flagged_edges = []
-            self.picked = self.selected_edge = ""
+            self.selected_nodes, self.selected_edge = [], ""
             self.fitted = self.stale = self.has_curve = self.has_equation = False
             self.evidence_caption = ""
             self._refresh(relayout=True)
@@ -542,50 +562,48 @@ class State(rx.State):
         self._graph_changed()
 
     @rx.event
-    def click_node(self, node: str):
-        """Select a node, or deselect it if it is already selected.
+    def click_node(self, node: str, info: dict):
+        """Select a node; with cmd (or ctrl) held, add it to the selection instead.
 
-        Clicking nodes never adds edges; use the "Add edge" dropdowns for that.
+        Selecting two nodes enables "Add edge" above the graph, drawn from the
+        one picked first to the one picked second. Clicking never adds an edge
+        by itself. A third cmd-click drops the oldest of the two.
         """
         self.error = ""
-        self.picked = "" if self.picked == node else node
+        multi = bool(info.get("meta_key") or info.get("ctrl_key"))
+        self.selected_nodes = b.next_selection(list(self.selected_nodes), node, multi)
         self.selected_edge = ""
         self._refresh()
         return State.show_selected_edge
 
     @rx.event
-    def set_new_from(self, value: str):
-        self.new_from = value
+    def swap_selected(self):
+        """Reverse the direction of the pending edge."""
+        self.selected_nodes = list(reversed(self.selected_nodes))
+        self._refresh()
 
     @rx.event
-    def set_new_to(self, value: str):
-        self.new_to = value
-
-    @rx.event
-    def add_edge(self):
-        """Add an edge from the two dropdowns (same effect as clicking two nodes)."""
+    def add_selected_edge(self):
+        """Add (or re-point) the edge between the two selected nodes."""
+        if len(self.selected_nodes) != 2:
+            return
+        source, target = self.selected_nodes
         self.error = ""
-        if not self.new_from or not self.new_to:
-            self.error = "Choose both a start and an end node."
-        elif self.new_from == self.new_to:
-            self.error = "Start and end must be different nodes."
-        elif self.new_from not in self.nodes or self.new_to not in self.nodes:
-            self.error = "Both nodes must be in the graph."
-        else:
-            self.picked = ""
-            self._put_edge(self.new_from, self.new_to)
+        self._put_edge(source, target)
+        if not self.error:  # a cycle keeps the selection so the direction can be swapped
+            self.selected_nodes = []
         self._refresh()
         return State.show_selected_edge
 
     @rx.event
     def clear_selection(self):
-        self.picked = self.selected_edge = ""
+        self.selected_nodes, self.selected_edge = [], ""
         self.has_curve = self.has_equation = False
         self._refresh()
 
     @rx.event
     def select_edge(self, key: str):
-        self.picked, self.error = "", ""
+        self.selected_nodes, self.error = [], ""
         self.selected_edge = "" if self.selected_edge == key else key
         self._refresh()
         return State.show_selected_edge
@@ -714,7 +732,7 @@ class State(rx.State):
         self.edges = [e for e in self.edges if b.edge_key(e["source"], e["target"]) not in dropped]
         self.flagged_edges = [k for k in self.flagged_edges if k not in dropped]
         self.flagged_nodes = [n for n in self.flagged_nodes if n != node]
-        self.picked = self.selected_edge = ""
+        self.selected_nodes, self.selected_edge = [], ""
         self._graph_changed()
         self._refresh(relayout=True)
 
@@ -775,7 +793,7 @@ class State(rx.State):
     @rx.event
     def add_violation_edge(self, source: str, target: str):
         """Add the edge a violation suggests (the user picks the direction)."""
-        self.error, self.picked = "", ""
+        self.error, self.selected_nodes = "", []
         if source in self.nodes and target in self.nodes:
             self._put_edge(source, target)
         self.selected_violation = ""

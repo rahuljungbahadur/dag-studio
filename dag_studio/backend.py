@@ -98,6 +98,21 @@ def graph_problems(nodes: list[str], edges: list[Edge], target: str = "") -> lis
     return problems
 
 
+def next_selection(current: list[str], node: str, multi: bool) -> list[str]:
+    """Node selection after a click.
+
+    A plain click selects only ``node`` (or clears it if it was the only one
+    selected). With ``multi`` (cmd or ctrl held) the node is toggled in the
+    selection, which holds at most two nodes: a third drops the oldest. Order
+    is kept, because the first node picked is the start of a new edge.
+    """
+    if not multi:
+        return [] if current == [node] else [node]
+    if node in current:
+        return [n for n in current if n != node]
+    return (current + [node])[-2:]
+
+
 def _dot_string(text: str) -> str:
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     return '"' + escaped.replace("\r\n", "\n").replace("\n", "\\n") + '"'

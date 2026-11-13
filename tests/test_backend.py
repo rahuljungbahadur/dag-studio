@@ -419,3 +419,18 @@ def test_fit_quality_warning_levels():
     assert len(borderline) == 1 and borderline[0].startswith("Borderline")
     bad = b.FitQuality([], max_rhat=1.2, min_ess=50, divergences=3).warnings()
     assert len(bad) == 3 and bad[0].startswith("The chains disagree")
+
+
+def test_next_selection():
+    pick = b.next_selection
+    assert pick([], "a", False) == ["a"]
+    assert pick(["a"], "a", False) == []  # plain click on the selected node deselects
+    assert pick(["a"], "b", False) == ["b"]  # plain click replaces the selection
+    assert pick(["a", "b"], "c", False) == ["c"]
+    # cmd-click builds up the pair in click order.
+    assert pick(["a"], "b", True) == ["a", "b"]
+    assert pick([], "a", True) == ["a"]
+    # cmd-click on a selected node removes just that one.
+    assert pick(["a", "b"], "a", True) == ["b"]
+    # A third node pushes out the oldest, so the button never gets stuck.
+    assert pick(["a", "b"], "c", True) == ["b", "c"]

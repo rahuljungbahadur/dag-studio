@@ -63,9 +63,11 @@ instruction.
 2. **Pick the outcome** and press **Discover DAG**. Dashed edges are ones the
    data cannot orient.
 3. **Edit the graph.**
-   - Add an edge with the two **Add edge** dropdowns in the left panel.
-     Doing this on an existing edge re-points it. Clicking nodes only
-     selects them; it never adds an edge.
+   - Add an edge: **⌘-click** (Ctrl-click on Windows and Linux) two nodes,
+     then press **Add edge** above the graph. The edge runs from the node you
+     picked first to the second; **⇄** swaps it. Doing this on a connected
+     pair re-points the edge. Clicking nodes only selects them; it never adds
+     an edge by itself. A third ⌘-click drops the oldest of the two.
    - Select an edge by clicking it: reverse it, give a dashed edge a
      direction, flag it, or delete it.
    - Select a node by clicking it: describe it, flag it for review or remove
@@ -127,8 +129,8 @@ drop zone too. Things to check:
   `revenue — v_2024_price_index` given `orders` (discovery missed that real
   effect). Click it and choose **Add v_2024_price_index → revenue**; the check
   is marked out of date. Validate again: what's left (about 2) is no more
-  than chance would flag. Try `revenue → ad_spend` to see the cycle check
-  refuse it.
+  than chance would flag. Try ⌘-clicking `revenue`, then `ad_spend`, and
+  pressing Add edge to see the cycle check refuse it.
 - Click a node, type a description, hover the node to see it, then
   **Export DOT** and look for the `tooltip` attribute.
 - **Fit model**, then click `orders → revenue`: the equation appears at once,
