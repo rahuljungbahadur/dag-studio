@@ -194,6 +194,13 @@ def test_fit_and_curve_recover_known_effect(monkeypatch):
     fig = b.make_figure(curve, df)
     assert len(fig.data) == 3
 
+    # A node with no edge into the outcome: E[revenue | do(season)] is the total effect through
+    # promo and demand: (0.5 + 0.6 * 0.7) * 0.9 = 0.83 per unit.
+    season = b.edge_curve(model, df, "season", "revenue")
+    season_slope = (season.mean[-1] - season.mean[0]) / (season.x[-1] - season.x[0])
+    assert season_slope == pytest.approx(0.83, abs=0.1)
+    assert b.effect_unavailable(edges, "season", "revenue") == ""
+
     # Bayesian R² for a gaussian node matches ordinary least squares.
     quality = b.fit_quality(fit)
     r2 = {n.node: n for n in quality.nodes}
@@ -451,3 +458,13 @@ def test_cycle_helpers():
     ring = b.find_cycle(chain + [b.Edge("d", "b")])
     assert sorted(ring) == ["b", "c", "d"]
     assert all(b.Edge(x, y) in chain + [b.Edge("d", "b")] for x, y in zip(ring, ring[1:]))
+
+
+def test_effect_unavailable_explains_why_a_node_has_no_curve():
+    edges = [b.Edge("a", "b"), b.Edge("b", "y"), b.Edge("y", "after"), b.Edge("a", "x", False)]
+    assert b.effect_unavailable(edges, "a", "y") == ""  # through b
+    assert b.effect_unavailable(edges, "b", "y") == ""
+    assert "is the outcome" in b.effect_unavailable(edges, "y", "y")
+    assert "no directed path to y" in b.effect_unavailable(edges, "after", "y")  # downstream
+    assert "no directed path to y" in b.effect_unavailable(edges, "lonely", "y")
+    assert "no directed path to y" in b.effect_unavailable(edges, "x", "y")  # only a dashed edge

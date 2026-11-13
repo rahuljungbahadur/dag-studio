@@ -104,7 +104,12 @@ instruction.
    2019): the share of its variance its parents explain, with an 89%
    interval. R² measures prediction, not causal correctness; use Validate DAG
    for the graph.
-6. **Click any edge** to see its fitted relationship and the fitted equation
+6. **Click any node** to see E[outcome | do(node)]: the outcome's posterior mean
+   (with an 89% band) when that node is set to x, summed over every directed
+   path from the node to the outcome, so a node with no edge into the outcome
+   still gets its indirect effect. A node with no path to the outcome, or the
+   outcome itself, says so instead of drawing a flat line.
+   **Click any edge** to see its fitted relationship and the fitted equation
    of its end node on the right.
    After a fit, each edge is coloured by the sign of its direct coefficient:
    blue (#008FD5) when it raises its child, red (#FC4F30) when it lowers it,

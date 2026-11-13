@@ -177,6 +177,7 @@ class State(rx.State):
     fig: go.Figure = go.Figure()
     has_curve: bool = False
     curve_caption: str = ""
+    effect_note: str = ""  # why a selected node has no E[outcome | do(node)] curve
     has_equation: bool = False
     equation_rows: list[EquationRow] = []
     equation_caption: str = ""
@@ -349,6 +350,7 @@ class State(rx.State):
         if self.fitted:
             self.stale = True
         self.has_curve = self.has_equation = False
+        self.effect_note = ""
         self.error = ""
 
     def _reset_graph(self) -> None:
@@ -514,6 +516,10 @@ class State(rx.State):
         return rows
 
     @rx.var
+    def effect_title(self) -> str:
+        return f"E[{self.target} | do({self.picked})]" if self.picked else ""
+
+    @rx.var
     def picked_r2(self) -> str:
         text = self._r2_text.get(self.picked, "")
         return f"R² = {text}" if text and self.fitted and not self.stale else ""
@@ -635,7 +641,7 @@ class State(rx.State):
         self.selected_nodes = b.next_selection(list(self.selected_nodes), node, multi)
         self.selected_edge = ""
         self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     @rx.event
     def swap_selected(self):
@@ -655,7 +661,7 @@ class State(rx.State):
         if not self.error:  # a cycle keeps the selection so the direction can be swapped
             self.selected_nodes = []
         self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     @rx.event
     def clear_selection(self):
@@ -669,7 +675,7 @@ class State(rx.State):
         self.selected_nodes, self.error, self.refused_cycle = [], "", []
         self.selected_edge = "" if self.selected_edge == key else key
         self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     @rx.event
     def delete_edge(self):
@@ -688,7 +694,7 @@ class State(rx.State):
                 self._put_edge(e["target"], e["source"])
                 break
         self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     @rx.event
     def orient_edge(self):
@@ -698,7 +704,7 @@ class State(rx.State):
                 self._put_edge(e["source"], e["target"])
                 break
         self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     @rx.event
     def toggle_flag_edge(self):
@@ -870,7 +876,7 @@ class State(rx.State):
             self._put_edge(source, target)
         self.selected_violation = ""
         self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     @rx.event
     def tidy_layout(self):
@@ -912,7 +918,7 @@ class State(rx.State):
             self.fitted, self.stale, self.busy = True, False, ""
             self._set_quality(quality, target)
             self._refresh()
-        return State.show_selected_edge
+        return State.show_selection
 
     def _set_quality(self, quality: "b.FitQuality", target: str) -> None:
         nodes = sorted(quality.nodes, key=lambda n: (n.node != target, n.node))
@@ -936,10 +942,14 @@ class State(rx.State):
         self.fit_trouble = not quality.max_rhat < b.RHAT_BAD or quality.divergences > 0
 
     @rx.event(background=True)
-    async def show_selected_edge(self):
-        """Fill the right-hand panel for the selected edge."""
+    async def show_selection(self):
+        """Fill the right-hand panel for the selected node or edge.
+
+        A node shows E[outcome | do(node)]: the total effect of setting it on the
+        outcome. An edge shows the same curve for its end node, plus its equation.
+        """
         async with self:
-            key = self.selected_edge
+            node, key = self.picked, self.selected_edge
             session = self._session()
             evidence = session.get("evidence", {}).get(key)
             self.evidence_caption = (
@@ -949,25 +959,33 @@ class State(rx.State):
                 (e for e in self.edges if b.edge_key(e["source"], e["target"]) == key), None
             )
             self.has_curve = self.has_equation = False
-            ready = edge and edge["directed"] and self.fitted and not self.stale
-            if not ready:
-                return
-            source, target = edge["source"], edge["target"]
-            equation = session.get("equations", {}).get(target)
-            if equation:
-                self.equation_rows = [
-                    EquationRow(expr, band, hit) for expr, band, hit in equation.lines(source)
-                ]
-                self.equation_caption = (
-                    f"Posterior means, with {equation.interval} intervals on the right. "
-                    f"The highlighted term is the direct effect of {source}; the curve "
-                    "above is the total effect through every path."
-                )
-                if target in self._r2_text:
-                    self.equation_caption += (
-                        f" Its parents explain R² = {self._r2_text[target]} of {target}'s variance."
+            self.effect_note = ""
+            ready = self.fitted and not self.stale
+            if node and ready:
+                self.effect_note = b.effect_unavailable(self._edge_objects(), node, self.target)
+                if self.effect_note:
+                    return
+                source, target = node, self.target
+            elif edge and edge["directed"] and ready:
+                source, target = edge["source"], edge["target"]
+                equation = session.get("equations", {}).get(target)
+                if equation:
+                    self.equation_rows = [
+                        EquationRow(expr, band, hit) for expr, band, hit in equation.lines(source)
+                    ]
+                    self.equation_caption = (
+                        f"Posterior means, with {equation.interval} intervals on the right. "
+                        f"The highlighted term is the direct effect of {source}; the curve "
+                        "above is the total effect through every path."
                     )
-                self.has_equation = True
+                    if target in self._r2_text:
+                        self.equation_caption += (
+                            f" Its parents explain R² = {self._r2_text[target]} of "
+                            f"{target}'s variance."
+                        )
+                    self.has_equation = True
+            else:
+                return
             if self.busy:
                 return
             cached = session["curves"].get((source, target))
@@ -987,12 +1005,19 @@ class State(rx.State):
 
         async with self:
             self.busy = ""
-            if self.selected_edge != key or self.stale:
+            if (self.picked, self.selected_edge) != (node, key) or self.stale:
                 return  # the user moved on while we were computing
             self.fig = b.make_figure(cached, session["df"])
             level = int(b.INTERVAL * 100)
-            self.curve_caption = (
-                f"Total effect: posterior mean of {target} when {source} is set to x, "
-                f"with a {level}% credible band. Grey points are the observed data."
-            )
+            if node:
+                self.curve_caption = (
+                    f"Total effect of {source} on {target}: posterior mean of {target} when "
+                    f"{source} is set to x, through every directed path in your graph, with a "
+                    f"{level}% credible band. Grey points are the observed data."
+                )
+            else:
+                self.curve_caption = (
+                    f"Total effect: posterior mean of {target} when {source} is set to x, "
+                    f"with a {level}% credible band. Grey points are the observed data."
+                )
             self.has_curve = True

@@ -1095,6 +1095,21 @@ def model_equations(model, families: dict[str, str] | None = None) -> dict[str, 
     return equations
 
 
+def effect_unavailable(edges: list[Edge], node: str, outcome: str) -> str:
+    """Why E[outcome | do(node)] would say nothing, or "" when the node can move the outcome."""
+    if node == outcome:
+        return (
+            f"{node} is the outcome. Select a node upstream of it to see how setting that "
+            f"node changes {outcome}."
+        )
+    if not directed_path(edges, node, outcome):
+        return (
+            f"{node} has no directed path to {outcome}, so setting it does not change "
+            f"{outcome} in this graph."
+        )
+    return ""
+
+
 def edge_curve(model, df: pl.DataFrame, source: str, target: str) -> Curve:
     """Posterior interventional mean of ``target`` as ``source`` is set.
 

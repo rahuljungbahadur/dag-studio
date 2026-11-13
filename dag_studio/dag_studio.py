@@ -519,6 +519,30 @@ def node_model_section() -> rx.Component:
     )
 
 
+def node_effect() -> rx.Component:
+    """E[outcome | do(node)] for the selected node, once the model is fitted."""
+    return rx.cond(
+        State.shows_effects,
+        rx.cond(
+            State.has_curve,
+            rx.vstack(
+                rx.text(State.effect_title, size="2", weight="medium", color=INK,
+                        style={"fontFamily": MONO}),
+                rx.plotly(data=State.fig, width="100%"),
+                hint(State.curve_caption),
+                spacing="2", width="100%", align="stretch", padding_y="4px",
+            ),
+            rx.cond(State.effect_note != "", hint(State.effect_note)),
+        ),
+        rx.cond(
+            State.fitted,
+            hint("The model changed since the last fit. Refit to see how setting this node "
+                 "changes the outcome.", color=AMBER),
+            hint("Fit the model to see how setting this node changes the outcome."),
+        ),
+    )
+
+
 def node_details() -> rx.Component:
     return rx.vstack(
         label("Node"),
@@ -527,6 +551,7 @@ def node_details() -> rx.Component:
             State.picked_r2 != "",
             hint(State.picked_r2, " of this node's variance is explained by its parents."),
         ),
+        node_effect(),
         rx.text_area(
             value=State.picked_description,
             on_change=State.set_description,
