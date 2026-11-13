@@ -35,6 +35,17 @@ def test_to_dot_round_trip_through_pathmc():
     assert pathmc.dag_to_spec(dot).split("\n") == ["b ~ a", "c ~ b"]
 
 
+def test_to_dot_carries_descriptions():
+    import pathmc
+
+    notes = {"a": 'Price in "USD"\nC:\\data -> b', "lonely": "unused", "b": "   "}
+    dot = b.to_dot(["a", "b", "lonely"], [b.Edge("a", "b")], descriptions=notes)
+    assert '"a" [tooltip="Price in \\"USD\\"\\nC:\\\\data -> b"];' in dot
+    assert '"lonely" [tooltip="unused"];' in dot
+    assert '"b" [' not in dot  # blank descriptions are dropped
+    assert pathmc.dag_to_spec(dot) == "b ~ a"
+
+
 def test_clean_table_handles_messy_input():
     raw = pl.DataFrame(
         {
@@ -51,6 +62,18 @@ def test_clean_table_handles_messy_input():
     assert len(notes) == 4
 
 
+def test_bundled_test_file_is_current_and_exercises_cleaning():
+    on_disk = pl.read_csv(b.TEST_FILE, infer_schema_length=10_000)
+    assert on_disk.equals(b.test_file_table()), (
+        "Regenerate with: b.test_file_table().write_csv(b.TEST_FILE)"
+    )
+    df, notes = b.load_table(b.TEST_FILE)
+    assert "region" not in df.columns and "tax_rate" not in df.columns
+    assert {"ad_spend", "v_2024_price_index", "web_visits"} <= set(df.columns)
+    assert df.height == 585
+    assert len(notes) == 4  # non-numeric, renamed, constant, missing rows
+
+
 def test_clean_table_rejects_unusable_input():
     with pytest.raises(ValueError, match="two numeric"):
         b.clean_table(pl.DataFrame({"a": [1.0] * 30, "s": ["x"] * 30}))
@@ -58,31 +81,31 @@ def test_clean_table_rejects_unusable_input():
         b.clean_table(pl.DataFrame({"a": [1.0, 2.0], "b": [2.0, 1.0]}))
 
 
-def test_layout_puts_causes_left_and_target_last():
+def test_layout_puts_causes_above_and_target_last():
     nodes = ["a", "b", "c", "y", "alone"]
     edges = [b.Edge("a", "b"), b.Edge("b", "y"), b.Edge("c", "y"), b.Edge("a", "c", False)]
     pos = b.layout(nodes, edges, target="y")
     assert set(pos) == set(nodes)
-    assert pos["a"][0] < pos["b"][0] < pos["y"][0]
-    assert pos["y"][0] == max(p[0] for p in pos.values())
+    assert pos["a"][1] < pos["b"][1] < pos["y"][1]
+    assert pos["y"][1] == max(p[1] for p in pos.values())
     assert len({tuple(p) for p in pos.values()}) == len(nodes)  # no overlaps
     width, height = b.canvas_size(pos)
     assert all(0 < x < width and 0 < y < height for x, y in pos.values())
 
 
 def test_edge_geometry():
-    d, arrow = b.edge_geometry((70, 100), (260, 100), True)
+    d, arrow = b.edge_geometry((300, 40), (300, 136), True)
     assert d.startswith("M ") and " Q " in d and len(arrow.split()) == 3
     # The path starts and ends outside the node boxes.
-    start_x = float(d.split()[1])
-    assert start_x > 70 + b.NODE_W / 2
-    _, no_arrow = b.edge_geometry((70, 100), (260, 100), False)
+    start_y = float(d.split()[2])
+    assert start_y > 40 + b.NODE_H / 2
+    _, no_arrow = b.edge_geometry((300, 40), (300, 136), False)
     assert no_arrow == ""
     # With nothing in the way the edge is straight (control point on the chord).
-    assert float(d.split()[5]) == 100.0
-    # A node sitting on the chord forces a bow around it.
-    d_bowed, _ = b.edge_geometry((70, 130), (450, 130), True, obstacles=[(260, 130)])
-    assert abs(float(d_bowed.split()[5]) - 130) > b.NODE_H
+    assert float(d.split()[4]) == 300.0
+    # A node sitting on the chord forces a sideways bow around it.
+    d_bowed, _ = b.edge_geometry((300, 40), (300, 232), True, obstacles=[(300, 136)])
+    assert abs(float(d_bowed.split()[4]) - 300) > b.NODE_W / 2
 
 
 def test_discover_recovers_demo_structure():

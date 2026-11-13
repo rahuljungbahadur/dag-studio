@@ -70,6 +70,14 @@ def data_section() -> rx.Component:
             ),
         ),
         rx.foreach(State.notes, lambda note: hint(note)),
+        hint(
+            "Manual testing: ",
+            rx.link("Load test file", on_click=State.load_test_file, size="1",
+                    underline="always"),
+            " · ",
+            rx.link("Download test file", size="1", underline="always",
+                    on_click=rx.download(url=f"/{b.TEST_FILE.name}")),
+        ),
     )
 
 
@@ -210,7 +218,11 @@ def node_el(n: NodeView) -> rx.Component:
             n.flagged,
             rx.el.svg.circle(cx=n.dot_x, cy=n.dot_y, r="4.5", fill=AMBER),
         ),
-        rx.el.svg.title(n.id),
+        rx.cond(
+            n.described,
+            rx.el.svg.circle(cx=n.note_x, cy=n.dot_y, r="3.5", fill=ACCENT),
+        ),
+        rx.el.svg.title(n.tooltip),
         on_click=State.click_node(n.id), cursor="pointer",
     )
 
@@ -235,8 +247,8 @@ def centre_panel() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             hint(
-                "Click a node, then another, to add an edge. Click an edge to inspect it. "
-                "Dashed edges have no direction yet."
+                "Click a node to describe it, then another node to add an edge. "
+                "Click an edge to inspect it. Dashed edges have no direction yet."
             ),
             rx.spacer(),
             rx.button("Tidy layout", on_click=State.tidy_layout, size="1", variant="ghost",
@@ -272,6 +284,13 @@ def node_details() -> rx.Component:
         label("Node"),
         rx.text(State.picked, size="3", weight="medium", color=INK),
         hint("Click another node to draw an edge from here."),
+        rx.text_area(
+            value=State.picked_description,
+            on_change=State.set_description,
+            placeholder="Describe this variable: what it measures, units, how it was collected…",
+            size="1", rows="4", resize="vertical", width="100%",
+        ),
+        hint("Saved as you type. Shown when you hover the node and included in the DOT export."),
         rx.hstack(
             small_button(rx.cond(State.picked_flagged, "Unflag", "Flag for review"),
                          State.toggle_flag_node),

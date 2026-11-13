@@ -33,9 +33,12 @@ class NodeView:
     text_y: str
     dot_x: str  # review marker, top-right corner
     dot_y: str
+    note_x: str  # description marker, top-left corner
     flagged: bool
     picked: bool
     is_target: bool
+    tooltip: str  # full name, plus the description when there is one
+    described: bool
 
 
 @dataclasses.dataclass
@@ -71,6 +74,7 @@ class State(rx.State):
     flagged_nodes: list[str] = []
     flagged_edges: list[str] = []
     positions: dict[str, list[float]] = {}
+    descriptions: dict[str, str] = {}  # node -> free-text note written by the user
 
     # --- selection ----------------------------------------------------
     picked: str = ""  # node clicked first; the next node click adds an edge
@@ -128,9 +132,12 @@ class State(rx.State):
                 text_y=f"{pos[n][1] + 4:.1f}",
                 dot_x=f"{pos[n][0] + b.NODE_W / 2 - 2:.1f}",
                 dot_y=f"{pos[n][1] - b.NODE_H / 2 + 2:.1f}",
+                note_x=f"{pos[n][0] - b.NODE_W / 2 + 2:.1f}",
                 flagged=n in self.flagged_nodes,
                 picked=n == self.picked,
                 is_target=n == self.target,
+                tooltip=f"{n}\n{self.descriptions[n]}" if self.descriptions.get(n) else n,
+                described=bool(self.descriptions.get(n, "").strip()),
             )
             for n in self.nodes
         ]
@@ -162,7 +169,7 @@ class State(rx.State):
     def _reset_graph(self) -> None:
         self.nodes, self.removed, self.edges = list(self.columns), [], []
         self.flagged_nodes, self.flagged_edges = [], []
-        self.positions = {}
+        self.positions, self.descriptions = {}, {}
         self.picked = self.selected_edge = ""
         self.fitted = self.stale = self.has_curve = False
         self.spec = self.curve_caption = self.coef_caption = self.evidence_caption = ""
@@ -223,6 +230,10 @@ class State(rx.State):
         return self.picked in self.flagged_nodes
 
     @rx.var
+    def picked_description(self) -> str:
+        return self.descriptions.get(self.picked, "")
+
+    @rx.var
     def review_queue(self) -> list[str]:
         edges = [k.replace("~", " – ") for k in self.flagged_edges]
         return list(self.flagged_nodes) + edges
@@ -256,6 +267,16 @@ class State(rx.State):
     def load_demo(self):
         note = "Synthetic demo data with a known DAG."
         self._set_table(b.demo_table(), [note], "demo data", target="revenue")
+
+    @rx.event
+    def load_test_file(self):
+        """Load the bundled messy CSV through the same cleaning as an upload."""
+        try:
+            df, notes = b.load_table(b.TEST_FILE)
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"Could not read the test file: {exc}"
+            return
+        self._set_table(df, notes, b.TEST_FILE.name, target="revenue")
 
     @rx.event
     def set_target(self, value: str):
@@ -408,6 +429,20 @@ class State(rx.State):
         self._refresh()
 
     @rx.event
+    def set_description(self, text: str):
+        """Store the note for the selected node. Kept if the node is removed and restored."""
+        node = self.picked
+        if not node:
+            return
+        descriptions = dict(self.descriptions)
+        if text.strip():
+            descriptions[node] = text
+        else:
+            descriptions.pop(node, None)
+        self.descriptions = descriptions
+        self._refresh()
+
+    @rx.event
     def remove_node(self):
         node = self.picked
         if not node:
@@ -441,7 +476,7 @@ class State(rx.State):
     def export_dot(self):
         flagged = [f"node {n}" for n in self.flagged_nodes]
         flagged += [f"edge {k.replace('~', ' -- ')}" for k in self.flagged_edges]
-        dot = b.to_dot(self.nodes, self._edge_objects(), flagged)
+        dot = b.to_dot(self.nodes, self._edge_objects(), flagged, self.descriptions)
         return rx.download(data=dot, filename="dag.dot")
 
     # ------------------------------------------------------------------

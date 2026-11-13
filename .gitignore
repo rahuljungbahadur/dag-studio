@@ -12,3 +12,4 @@ __pycache__/
 # Never commit datasets by accident
 *.csv
 *.parquet
+!assets/dag_studio_test_data.csv

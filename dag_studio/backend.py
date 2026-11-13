@@ -30,9 +30,9 @@ MAX_SCATTER = 600  # observed points drawn behind the curve
 RANDOM_SEED = 0
 
 NODE_W, NODE_H = 104.0, 34.0
-LAYER_GAP, ROW_GAP = 190.0, 78.0
-MARGIN_X, MARGIN_Y = 70.0, 44.0
-MIN_CENTRE_Y = 130.0  # keeps small graphs vertically centred on the canvas
+LAYER_GAP, ROW_GAP = 96.0, 136.0  # vertical gap between layers, horizontal gap within one
+MARGIN_X, MARGIN_Y = 70.0, 36.0
+MIN_CENTRE_X = 320.0  # keeps small graphs horizontally centred on the canvas
 
 
 # --------------------------------------------------------------------------
@@ -96,12 +96,30 @@ def graph_problems(nodes: list[str], edges: list[Edge]) -> list[str]:
     return problems
 
 
-def to_dot(nodes: list[str], edges: list[Edge], flagged: list[str] | None = None) -> str:
-    """DOT text for the graph. Flagged items are listed as comments."""
+def _dot_string(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped.replace("\r\n", "\n").replace("\n", "\\n") + '"'
+
+
+def to_dot(
+    nodes: list[str],
+    edges: list[Edge],
+    flagged: list[str] | None = None,
+    descriptions: dict[str, str] | None = None,
+) -> str:
+    """DOT text for the graph.
+
+    Node descriptions become ``tooltip`` attributes; flagged items are listed
+    as comments.
+    """
     lines = ["digraph {"]
     connected = {e.source for e in edges} | {e.target for e in edges}
+    descriptions = descriptions or {}
     for n in nodes:
-        if n not in connected:
+        text = descriptions.get(n, "").strip()
+        if text:
+            lines.append(f'  "{n}" [tooltip={_dot_string(text)}];')
+        elif n not in connected:
             lines.append(f'  "{n}";')
     for e in edges:
         if e.directed:
@@ -263,7 +281,7 @@ def discover(
 
 
 def layout(nodes: list[str], edges: list[Edge], target: str = "") -> dict[str, tuple[float, float]]:
-    """Left-to-right layered layout. Causes sit left of their effects."""
+    """Top-down layered layout. Causes sit above their effects."""
     if not nodes:
         return {}
 
@@ -298,37 +316,37 @@ def layout(nodes: list[str], edges: list[Edge], target: str = "") -> dict[str, t
     if target in layer:
         layer[target] = max(layer.values())
 
-    columns: dict[int, list[str]] = {}
+    rows: dict[int, list[str]] = {}
     for n in sorted(nodes):
-        columns.setdefault(layer[n], []).append(n)
+        rows.setdefault(layer[n], []).append(n)
 
     # One barycentre sweep to reduce crossings.
-    row: dict[str, float] = {}
-    for depth_i in sorted(columns):
-        members = columns[depth_i]
+    slot: dict[str, float] = {}
+    for depth_i in sorted(rows):
+        members = rows[depth_i]
         if depth_i > 0:
             members.sort(
                 key=lambda n: (
-                    np.mean([row[p] for p in parents[n] if p in row]) if parents[n] else 0.0,
+                    np.mean([slot[p] for p in parents[n] if p in slot]) if parents[n] else 0.0,
                     n,
                 )
             )
         for i, n in enumerate(members):
-            row[n] = i - (len(members) - 1) / 2
+            slot[n] = i - (len(members) - 1) / 2
 
-    tallest = max(len(m) for m in columns.values())
-    centre_y = max(MARGIN_Y + (tallest - 1) * ROW_GAP / 2, MIN_CENTRE_Y)
+    widest = max(len(m) for m in rows.values())
+    centre_x = max(MARGIN_X + (widest - 1) * ROW_GAP / 2, MIN_CENTRE_X)
     return {
-        n: (MARGIN_X + layer[n] * LAYER_GAP, centre_y + row[n] * ROW_GAP) for n in nodes
+        n: (centre_x + slot[n] * ROW_GAP, MARGIN_Y + layer[n] * LAYER_GAP) for n in nodes
     }
 
 
 def canvas_size(positions: dict[str, tuple[float, float]]) -> tuple[float, float]:
     if not positions:
-        return 640.0, 2 * MIN_CENTRE_Y
+        return 2 * MIN_CENTRE_X, 320.0
     xs = [p[0] for p in positions.values()]
     ys = [p[1] for p in positions.values()]
-    return max(xs) + MARGIN_X, max(max(ys) + MARGIN_Y, 2 * MIN_CENTRE_Y)
+    return max(max(xs) + MARGIN_X, 2 * MIN_CENTRE_X), max(ys) + MARGIN_Y
 
 
 def _clip(cx: float, cy: float, tx: float, ty: float) -> tuple[float, float]:
@@ -369,18 +387,18 @@ def edge_geometry(
 ) -> tuple[str, str]:
     """SVG path ``d`` and arrowhead polygon ``points`` for one edge.
 
-    The edge is straight when nothing is in the way. Otherwise it is bowed up
-    or down, whichever keeps it clear of the other node boxes (``obstacles``
+    The edge is straight when nothing is in the way. Otherwise it is bowed left
+    or right, whichever keeps it clear of the other node boxes (``obstacles``
     are their centres).
     """
     (x1, y1), (x2, y2) = p_source, p_target
     mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-    span = max(abs(x2 - x1) / LAYER_GAP, 1.0)
-    step = 34.0 + 22.0 * (span - 1)
+    span = max(abs(y2 - y1) / LAYER_GAP, 1.0)
+    step = 70.0 + 30.0 * (span - 1)
 
     best, best_gap = (mx, my), -math.inf
     for bow in (0.0, -step, step, -2 * step, 2 * step):
-        control = (mx, max(my + bow, 2.0))
+        control = (max(mx + bow, 2.0), my)
         start, end = _clip(x1, y1, *control), _clip(x2, y2, *control)
         gap = _clearance(start, control, end, obstacles or [])
         if gap > best_gap + 1e-9:
@@ -565,4 +583,52 @@ def demo_table(n: int = 800, seed: int = 7) -> pl.DataFrame:
     noise = rng.normal(size=n)
     return pl.DataFrame(
         dict(season=season, price=price, promo=promo, demand=demand, revenue=revenue, noise=noise)
+    )
+
+
+TEST_FILE = Path(__file__).resolve().parent.parent / "assets" / "dag_studio_test_data.csv"
+
+
+def test_file_table(n: int = 600, seed: int = 11) -> pl.DataFrame:
+    """Raw, deliberately messy data for trying every part of the app by hand.
+
+    It goes through the same cleaning as an upload. Known structure (four layers
+    when drawn top-down):
+
+        ad spend -> web visits, season -> web visits, season -> store visits,
+        web visits -> orders, store visits -> orders, 2024 price index -> orders,
+        orders -> revenue, 2024 price index -> revenue,
+        orders -> customer_satisfaction_score
+
+    ``noise`` is unrelated to everything. Cleaning should rename two columns,
+    ignore ``region`` (text) and ``tax_rate`` (constant), and drop the rows
+    where ``web visits`` is missing.
+    """
+    rng = np.random.default_rng(seed)
+    ad_spend = rng.normal(size=n)
+    season = rng.normal(size=n)
+    price = rng.normal(size=n)
+    web = 0.8 * ad_spend + 0.5 * season + rng.normal(size=n)
+    store = 0.7 * season + rng.normal(size=n)
+    orders = 0.6 * web + 0.5 * store - 0.7 * price + rng.normal(size=n)
+    revenue = 0.9 * orders + 0.4 * price + rng.normal(scale=0.8, size=n)
+    satisfaction = 0.6 * orders + rng.normal(size=n)
+    noise = rng.normal(size=n)
+
+    web_visits = [None if i % 40 == 7 else float(v) for i, v in enumerate(web)]
+    regions = ["north", "south", "east", "west"]
+    return pl.DataFrame(
+        {
+            "ad spend": ad_spend.round(4),
+            "season": season.round(4),
+            "2024 price index": price.round(4),
+            "region": [regions[i % 4] for i in range(n)],
+            "web visits": pl.Series(web_visits).round(4),
+            "store visits": store.round(4),
+            "orders": orders.round(4),
+            "tax_rate": [0.2] * n,
+            "customer_satisfaction_score": satisfaction.round(4),
+            "noise": noise.round(4),
+            "revenue": revenue.round(4),
+        }
     )
