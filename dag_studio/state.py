@@ -116,6 +116,25 @@ _SYMBOLS = {"mu": "μ", "sigma": "σ", "alpha": "α", "beta": "β"}
 _ACCENT, _AMBER, _EDGE = "#2563eb", "#d97706", "#9aa5b1"
 
 
+async def _follow(state, task: "asyncio.Task", progress: b.Progress) -> None:
+    """Push a worker's progress to the page until ``task`` finishes.
+
+    ``state`` is the background handler's ``self``. Only changes are sent, so a
+    quiet task does not flood the connection.
+    """
+    last = None
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        if done:
+            return
+        label, fraction = progress.snapshot()
+        current = (label, None if fraction is None else round(fraction * 100))
+        if current != last and label:
+            last = current
+            async with state:
+                state._set_progress(label, fraction)
+
+
 def _short(name: str, limit: int = 13) -> str:
     return name if len(name) <= limit else name[: limit - 1] + "…"
 
@@ -186,6 +205,10 @@ class State(rx.State):
     # --- feedback -----------------------------------------------------
     busy: str = ""  # non-empty while a long task runs; shown next to a spinner
     error: str = ""
+    # Progress bar for discovery and fitting; empty label means no bar is shown.
+    progress_label: str = ""
+    progress_pct: int = 0
+    progress_known: bool = False  # False: the task cannot say how far along it is
 
     # ------------------------------------------------------------------
     # Helpers
@@ -196,6 +219,11 @@ class State(rx.State):
 
     def _edge_objects(self) -> list[b.Edge]:
         return [b.Edge(e["source"], e["target"], e["directed"]) for e in self.edges]
+
+    def _set_progress(self, label: str, fraction: float | None) -> None:
+        self.progress_label = label
+        self.progress_known = fraction is not None
+        self.progress_pct = 0 if fraction is None else int(round(fraction * 100))
 
     def _graph_sig(self) -> str:
         edges = sorted(
@@ -400,6 +428,10 @@ class State(rx.State):
         return self.busy != ""
 
     @rx.var
+    def show_progress(self) -> bool:
+        return self.progress_label != ""
+
+    @rx.var
     def selected_label(self) -> str:
         for e in self.edges:
             if b.edge_key(e["source"], e["target"]) == self.selected_edge:
@@ -591,12 +623,19 @@ class State(rx.State):
                 self.error = f"The outcome '{self.target}' was removed. Restore it first."
                 return
             self.busy, self.error = "Running TBFPC discovery…", ""
+            self._set_progress("Starting TBFPC", None)
             session, target, nodes = self._session(), self.target, list(self.nodes)
+        progress = b.Progress()
+        task = asyncio.create_task(
+            asyncio.to_thread(b.discover, session["df"], target, nodes, progress)
+        )
         try:
-            edges, evidence = await asyncio.to_thread(b.discover, session["df"], target, nodes)
+            await _follow(self, task, progress)
+            edges, evidence = task.result()
         except Exception as exc:  # noqa: BLE001
             async with self:
                 self.busy, self.error = "", f"Discovery failed: {exc}"
+                self.progress_label = ""
             return
         async with self:
             session["evidence"], session["curves"] = evidence, {}
@@ -607,7 +646,7 @@ class State(rx.State):
             self.fitted = self.stale = self.has_curve = self.has_equation = False
             self.evidence_caption = ""
             self._refresh(relayout=True)
-            self.busy = ""
+            self.busy = self.progress_label = ""
 
     # ------------------------------------------------------------------
     # Graph editing
@@ -899,23 +938,35 @@ class State(rx.State):
             if self.busy or self.problems:
                 return
             self.busy, self.error = "Fitting the model with pathmc (MCMC)…", ""
+            self._set_progress(b.fit_step(1), None)
             session, nodes, edges = self._session(), list(self.nodes), self._edge_objects()
             target, families = self.target, dict(self.families)
             priors = {n: dict(v) for n, v in self.prior_text.items()}
-        try:
+        progress = b.Progress()
+
+        async def work():
             fit = await asyncio.to_thread(
-                b.fit_model, session["df"], nodes, edges, target, families, priors
+                b.fit_model, session["df"], nodes, edges, target, families, priors, progress
             )
+            progress.set(b.fit_step(4))
             equations = await asyncio.to_thread(b.model_equations, fit.model, families)
             quality = await asyncio.to_thread(b.fit_quality, fit)
+            return fit, equations, quality
+
+        task = asyncio.create_task(work())
+        try:
+            await _follow(self, task, progress)
+            fit, equations, quality = task.result()
         except Exception as exc:  # noqa: BLE001
             async with self:
                 self.busy, self.error = "", f"Fit failed: {exc}"
+                self.progress_label = ""
             return
         async with self:
             session["model"], session["curves"] = fit.model, {}
             session["equations"] = equations
-            self.fitted, self.stale, self.busy = True, False, ""
+            self.fitted, self.stale = True, False
+            self.busy = self.progress_label = ""
             self._set_quality(quality, target)
             self._refresh()
         return State.show_selection

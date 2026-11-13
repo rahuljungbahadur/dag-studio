@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -244,6 +246,159 @@ def clean_table(raw: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
 
 
 # --------------------------------------------------------------------------
+# Progress reporting for long tasks
+# --------------------------------------------------------------------------
+
+
+class Progress:
+    """What a long task is doing: written by the worker thread, polled by the UI.
+
+    ``fraction`` is 0 to 1 when the task can say how far along it is, and None
+    when it cannot (the UI then shows an animated bar instead of a percentage).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._label, self._fraction = "", None
+
+    def set(self, label: str, fraction: float | None = None) -> None:
+        with self._lock:
+            self._label = label
+            self._fraction = None if fraction is None else min(max(fraction, 0.0), 1.0)
+
+    def snapshot(self) -> tuple[str, float | None]:
+        with self._lock:
+            return self._label, self._fraction
+
+
+FIT_STEPS = (
+    "Compiling the model",
+    "Drawing samples",
+    "Finishing the posterior",
+    "Computing equations and fit quality",
+)
+
+
+def fit_step(n: int) -> str:
+    """Label for fit step ``n`` (1-based), e.g. "Step 2 of 4 · Drawing samples"."""
+    return f"Step {n} of {len(FIT_STEPS)} · {FIT_STEPS[n - 1]}"
+
+
+_sink = threading.local()  # the sampling-progress callback of the fit running on this thread
+_hook_lock = threading.Lock()
+_hook_installed = False
+
+
+def _install_sampling_hook() -> bool:
+    """Let a fit report nutpie's per-chain draw counts.
+
+    PyMC already hands nutpie a progress callback (it feeds PyMC's own progress
+    bar, which we keep switched off). This wraps that callback's ``update`` so a
+    copy of the counts also reaches the sink of the fit that created it. Returns
+    False, and the fit simply reports no sampling progress, if PyMC's internals
+    are not as expected.
+    """
+    global _hook_installed
+    with _hook_lock:
+        if _hook_installed:
+            return True
+        try:
+            from pymc.progress_bar.progress import NutpieProgressBarManager as Manager
+
+            original_init, original_update = Manager.__init__, Manager.update
+        except Exception:  # noqa: BLE001 - cosmetic feature, never break a fit
+            return False
+
+        def init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self._dag_studio_sink = getattr(_sink, "callback", None)
+
+        def update(self, chain_progresses):
+            callback = getattr(self, "_dag_studio_sink", None)
+            if callback is not None:
+                try:
+                    callback(chain_progresses)
+                except Exception:  # noqa: BLE001
+                    pass
+            return original_update(self, chain_progresses)
+
+        Manager.__init__, Manager.update = init, update
+        _hook_installed = True
+        return True
+
+
+@contextmanager
+def _watch_sampling(progress: Progress | None):
+    """Report MCMC draws to ``progress`` while the ``with`` body runs a fit."""
+    if progress is None or not _install_sampling_hook():
+        yield
+        return
+
+    def callback(chain_progresses) -> None:
+        done = sum(int(c.finished_draws) for c in chain_progresses)
+        total = sum(int(c.total_draws) for c in chain_progresses)
+        if total <= 0:
+            return
+        if done >= total:
+            progress.set(fit_step(3))
+        else:
+            progress.set(fit_step(2), done / total)
+
+    _sink.callback = callback
+    try:
+        yield
+    finally:
+        _sink.callback = None
+
+
+def _watch_tbfpc(model, drivers: list[str], progress: Progress) -> None:
+    """Make ``model`` (a TBFPC) report how many variable pairs it has examined.
+
+    TBFPC makes one pass per driver (its link to the outcome), then one per pair
+    of drivers. Each pass runs many tests, so passes are the honest unit: the
+    bar is "passes finished of passes to do". Counts are taken by watching which
+    pair each conditional-independence test is for.
+    """
+    d = len(drivers)
+    phases = [
+        ("_test_target_edges", "Testing which variables drive the outcome", d),
+        ("_test_driver_skeleton", "Testing links between the other variables", d * (d - 1) // 2),
+    ]
+    total = max(sum(n for _, _, n in phases), 1)
+    ctx = {"offset": 0, "count": 0, "pair": None, "n": 1, "text": ""}
+
+    original_test = model._ci_independent
+
+    def counting_test(df, x, y, cond):
+        pair = (x, y)
+        if pair != ctx["pair"]:
+            if ctx["pair"] is not None:
+                ctx["count"] += 1
+            ctx["pair"] = pair
+            progress.set(
+                f"{ctx['text']} ({ctx['count'] + 1} of {ctx['n']})",
+                (ctx["offset"] + ctx["count"]) / total,
+            )
+        return original_test(df, x, y, cond)
+
+    model._ci_independent = counting_test
+
+    offset = 0
+    for name, text, n in phases:
+        original_phase = getattr(model, name)
+
+        def phase(*args, _original=original_phase, _text=text, _n=n, _offset=offset, **kwargs):
+            ctx.update(offset=_offset, count=0, pair=None, n=max(_n, 1), text=_text)
+            progress.set(f"{_text} (1 of {max(_n, 1)})", _offset / total)
+            result = _original(*args, **kwargs)
+            progress.set(_text, (_offset + _n) / total)
+            return result
+
+        setattr(model, name, phase)
+        offset += n
+
+
+# --------------------------------------------------------------------------
 # Discovery (pathmc TBFPC)
 # --------------------------------------------------------------------------
 
@@ -275,12 +430,16 @@ def format_bf(value: float) -> str:
 
 
 def discover(
-    df: pl.DataFrame, target: str, nodes: list[str] | None = None
+    df: pl.DataFrame,
+    target: str,
+    nodes: list[str] | None = None,
+    progress: Progress | None = None,
 ) -> tuple[list[Edge], dict[str, Evidence]]:
     """Run TBFPC and return its CPDAG plus per-pair evidence.
 
     ``nodes`` restricts discovery to a subset of columns (the target is always
-    included). Columns are standardised first, as pathmc recommends.
+    included). Columns are standardised first, as pathmc recommends. If
+    ``progress`` is given it is kept up to date while TBFPC runs.
     """
     from pathmc import TBFPC
 
@@ -301,7 +460,15 @@ def discover(
             bf_thresh=BF_THRESHOLD,
             max_conditioning_set_size=MAX_CONDITIONING_SET,
         )
+        if progress is not None:
+            progress.set("Starting TBFPC")
+            try:
+                _watch_tbfpc(model, drivers, progress)
+            except Exception:  # noqa: BLE001 - progress is cosmetic; fall back to no counts
+                pass
         model.fit(z, drivers=drivers)
+    if progress is not None:
+        progress.set("Reading the results")
 
     edges = [Edge(u, v, True) for u, v in model.get_directed_edges()]
     edges += [Edge(u, v, False) for u, v in model.get_undirected_edges()]
@@ -766,12 +933,16 @@ def fit_model(
     target: str,
     families: dict[str, str] | None = None,
     priors: dict[str, dict[str, str]] | None = None,
+    progress: Progress | None = None,
 ):
     """Build the model with pathmc's ``BuildModelFromDAG`` (native style) and run MCMC.
 
     ``families`` maps node -> family and ``priors`` maps node -> the numbers
     typed in the UI (see :func:`prior_specs`). Settings for nodes without
     parents, and "gaussian" (the default), are left out of the call.
+    If ``progress`` is given it is kept up to date: compiling and finishing have
+    no counts, but sampling reports the share of draws done.
+
     Returns a :class:`FitResult`.
     """
     import pathmc
@@ -805,7 +976,9 @@ def fit_model(
     )
     model = builder.to_pathmodel()
     spec = pathmc.dag_to_spec(dag)
-    with warnings.catch_warnings():
+    if progress is not None:
+        progress.set(fit_step(1))
+    with warnings.catch_warnings(), _watch_sampling(progress):
         warnings.simplefilter("ignore")
         idata = model.fit(
             draws=DRAWS,

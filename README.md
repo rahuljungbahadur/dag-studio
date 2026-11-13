@@ -60,8 +60,10 @@ instruction.
 1. **Upload** a CSV or Parquet file. Numeric columns become nodes; non-numeric
    and constant columns are ignored, and rows with missing values are dropped.
    The left panel lists exactly what was changed.
-2. **Pick the outcome** and press **Discover DAG**. Dashed edges are ones the
-   data cannot orient.
+2. **Pick the outcome** and press **Discover DAG**. A progress bar in the top
+   right shows how many of TBFPC's passes (one per variable's link to the
+   outcome, then one per pair of other variables) are done. Dashed edges are
+   ones the data cannot orient.
 3. **Edit the graph.**
    - Add an edge: **⌘-click** (Ctrl-click on Windows and Linux) two nodes,
      then press **Add edge** above the graph. The edge runs from the node you
@@ -96,7 +98,10 @@ instruction.
 5. **Fit model** once every edge has a direction and the outcome has at least
    one edge. The graph, outcome, families and priors go to pathmc's
    `BuildModelFromDAG(style="native")`, then MCMC runs (roughly 10 to 60
-   seconds).
+   seconds). The progress bar in the top right names the step: compiling the
+   model, drawing samples (the only step that reports a percentage), finishing
+   the posterior, then computing equations and fit quality. Steps that cannot
+   say how far along they are show an animated bar instead of a number.
 
    **Fit quality** appears in the right panel: sampler diagnostics (4 chains; largest
    r̂, smallest effective sample size, divergences, with a warning when the

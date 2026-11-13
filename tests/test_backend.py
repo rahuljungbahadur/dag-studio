@@ -468,3 +468,92 @@ def test_effect_unavailable_explains_why_a_node_has_no_curve():
     assert "no directed path to y" in b.effect_unavailable(edges, "after", "y")  # downstream
     assert "no directed path to y" in b.effect_unavailable(edges, "lonely", "y")
     assert "no directed path to y" in b.effect_unavailable(edges, "x", "y")  # only a dashed edge
+
+
+class RecordingProgress(b.Progress):
+    """A Progress that also keeps every update, to check what a task reported."""
+
+    def __init__(self):
+        super().__init__()
+        self.log: list[tuple[str, float | None]] = []
+
+    def set(self, label, fraction=None):
+        super().set(label, fraction)
+        self.log.append((label, self.snapshot()[1]))
+
+
+def test_progress_snapshot_clamps_and_allows_unknown():
+    progress = b.Progress()
+    assert progress.snapshot() == ("", None)
+    progress.set("Working", 0.4)
+    assert progress.snapshot() == ("Working", 0.4)
+    progress.set("Over", 1.7)
+    assert progress.snapshot()[1] == 1.0
+    progress.set("Under", -0.2)
+    assert progress.snapshot()[1] == 0.0
+    progress.set("Unknown")
+    assert progress.snapshot() == ("Unknown", None)
+
+
+def test_discover_reports_progress_without_changing_its_result():
+    df = b.demo_table()
+    progress = RecordingProgress()
+    edges, evidence = b.discover(df, target="revenue", progress=progress)
+    plain_edges, plain_evidence = b.discover(df, target="revenue")
+    assert edges == plain_edges
+    assert {k: (v.bf10, v.conditioning_set) for k, v in evidence.items()} == {
+        k: (v.bf10, v.conditioning_set) for k, v in plain_evidence.items()
+    }
+
+    fractions = [f for _, f in progress.log if f is not None]
+    assert fractions == sorted(fractions)  # never goes backwards
+    assert fractions[0] == 0.0 and fractions[-1] == 1.0
+    phases = []
+    for label, _ in progress.log:
+        name = label.split(" (")[0]
+        if not phases or phases[-1] != name:
+            phases.append(name)
+    assert phases == [
+        "Starting TBFPC",
+        "Testing which variables drive the outcome",
+        "Testing links between the other variables",
+        "Reading the results",
+    ]
+    # 5 drivers -> 5 outcome passes then 10 driver-pair passes, each counted "n of total".
+    assert any(label.endswith("(5 of 5)") for label, _ in progress.log)
+    assert any(label.endswith("(10 of 10)") for label, _ in progress.log)
+
+
+def test_fit_step_labels():
+    assert b.fit_step(1) == "Step 1 of 4 · Compiling the model"
+    assert b.fit_step(4) == "Step 4 of 4 · Computing equations and fit quality"
+
+
+@pytest.mark.slow
+def test_fit_reports_progress_and_the_hook_does_not_leak(monkeypatch):
+    monkeypatch.setattr(b, "DRAWS", 200)
+    monkeypatch.setattr(b, "TUNE", 200)
+    df = b.demo_table(300)
+    nodes, edges = ["price", "demand"], [b.Edge("price", "demand")]
+
+    progress = RecordingProgress()
+    b.fit_model(df, nodes, edges, "demand", progress=progress)
+    labels = [label for label, _ in progress.log]
+    assert labels[0] == b.fit_step(1) and progress.log[0][1] is None  # compiling: no count
+    sampling = [f for label, f in progress.log if label == b.fit_step(2)]
+    assert sampling and all(f is not None for f in sampling)
+    assert sampling == sorted(sampling) and sampling[-1] < 1.0
+    assert labels[-1] == b.fit_step(3)  # all draws done: finishing, no count
+    assert b._sink.callback is None  # cleared once the fit is over
+
+    # A later fit without progress must not write into the earlier fit's progress.
+    n_before = len(progress.log)
+    b.fit_model(df, nodes, edges, "demand")
+    assert len(progress.log) == n_before
+
+    # If PyMC's internals ever change, the fit still works and just reports step 1.
+    monkeypatch.setattr(b, "_install_sampling_hook", lambda: False)
+    fallback = RecordingProgress()
+    fit = b.fit_model(df, nodes, edges, "demand", progress=fallback)
+    assert [label for label, _ in fallback.log] == [b.fit_step(1)]
+    assert fit.idata is not None

@@ -738,14 +738,37 @@ def right_panel() -> rx.Component:
 # --------------------------------------------------------------------------
 
 
+def progress_bar() -> rx.Component:
+    """Progress of discovery or a fit: a percentage when known, else an animated bar."""
+    return rx.vstack(
+        rx.hstack(
+            rx.text(State.progress_label, size="1", color=INK, no_of_lines=1),
+            rx.spacer(),
+            rx.cond(State.progress_known, hint(State.progress_pct, "%")),
+            width="100%", align="center", spacing="2",
+        ),
+        rx.cond(
+            State.progress_known,
+            rx.progress(value=State.progress_pct, max=100, size="2", color_scheme="blue"),
+            # No value: Radix animates the bar instead. It grows over `duration`, then pulses.
+            rx.progress(size="2", color_scheme="blue", duration="12s"),
+        ),
+        spacing="1", width="300px", align="stretch",
+    )
+
+
 def status_bar() -> rx.Component:
     return rx.hstack(
         rx.text("DAG Studio", size="3", weight="medium", color=INK),
         hint("pathmc discovery, review and fit"),
         rx.spacer(),
         rx.cond(
-            State.is_busy,
-            rx.hstack(rx.spinner(size="1"), hint(State.busy), spacing="2", align="center"),
+            State.show_progress,
+            progress_bar(),
+            rx.cond(
+                State.is_busy,
+                rx.hstack(rx.spinner(size="1"), hint(State.busy), spacing="2", align="center"),
+            ),
         ),
         rx.cond(State.error != "", rx.text(State.error, size="1", color=RED)),
         width="100%", align="center", spacing="3",

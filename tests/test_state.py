@@ -162,3 +162,76 @@ def test_empty_states(found, left):
     ]
     st._refresh()
     assert st.violations_left == left
+
+
+class FakeState:
+    """Stands in for a background handler's `self`: records what would be pushed."""
+
+    def __init__(self):
+        self.pushed: list[tuple[str, int | None]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def _set_progress(self, label, fraction):
+        self.pushed.append((label, None if fraction is None else round(fraction * 100)))
+
+
+def test_follow_pushes_only_changes_and_stops_when_the_task_ends():
+    import asyncio
+
+    from dag_studio import backend as b
+    from dag_studio.state import _follow
+
+    async def run():
+        progress, state = b.Progress(), FakeState()
+
+        async def worker():
+            for label, fraction in [("one", 0.1), ("one", 0.1), ("two", 0.5), ("three", None)]:
+                progress.set(label, fraction)
+                await asyncio.sleep(0.5)
+            return "done"
+
+        task = asyncio.create_task(worker())
+        await _follow(state, task, progress)
+        return state.pushed, task.result()
+
+    pushed, result = asyncio.run(run())
+    assert result == "done"
+    assert pushed == [("one", 10), ("two", 50), ("three", None)]  # the repeat was not re-sent
+
+
+def test_follow_leaves_a_failed_task_for_the_caller_to_raise():
+    import asyncio
+
+    from dag_studio import backend as b
+    from dag_studio.state import _follow
+
+    async def run():
+        async def worker():
+            raise ValueError("boom")
+
+        task = asyncio.create_task(worker())
+        await _follow(FakeState(), task, b.Progress())
+        return task
+
+    task = asyncio.run(run())
+    with pytest.raises(ValueError, match="boom"):
+        task.result()
+
+
+def test_set_progress_and_show_progress():
+    st = State(_reflex_internal_init=True)
+    assert st.show_progress is False
+    st._set_progress("Step 2 of 4 · Drawing samples", 0.456)
+    assert (st.progress_label, st.progress_pct, st.progress_known) == (
+        "Step 2 of 4 · Drawing samples", 46, True,
+    )
+    assert st.show_progress is True
+    st._set_progress("Compiling", None)
+    assert st.progress_known is False and st.progress_pct == 0 and st.show_progress is True
+    st.progress_label = ""
+    assert st.show_progress is False
