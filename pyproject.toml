@@ -1,0 +1,27 @@
+[project]
+name = "dag-studio"
+version = "0.1.0"
+description = "A minimal Reflex UI for building, reviewing and fitting causal DAGs with pathmc."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pathmc>=0.6,<0.7",   # pre-1.0: the discovery API may change between minor versions
+    "reflex>=0.11,<0.12",
+    "polars>=1.0",
+    "pyarrow",            # polars -> pandas hand-off for pathmc
+    "pandas",
+    "plotly>=5",
+    "nutpie",             # faster NUTS sampler; pathmc uses it when installed
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["slow: runs MCMC (about 30 seconds)"]
+filterwarnings = ["ignore"]
+
+[tool.ruff]
+line-length = 100

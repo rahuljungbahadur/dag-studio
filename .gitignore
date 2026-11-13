@@ -1,0 +1,14 @@
+.web
+.states
+.venv/
+.web/
+.states/
+uploaded_files/
+assets/external/
+*.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Never commit datasets by accident
+*.csv
+*.parquet
