@@ -626,31 +626,6 @@ def right_panel() -> rx.Component:
             ),
         ),
         fit_quality_section(),
-        rx.cond(
-            State.fitted,
-            rx.vstack(
-                label("Fitted with"),
-                rx.el.pre(
-                    State.fit_code,
-                    style={"fontSize": "12px", "margin": "0", "color": INK,
-                           "whiteSpace": "pre-wrap", "fontFamily": MONO},
-                ),
-                hint("data is the cleaned table. Prior comes from pymc_extras.prior."),
-                spacing="2", width="100%",
-            ),
-        ),
-        rx.cond(
-            State.fitted,
-            rx.vstack(
-                label("Fitted pathmc spec"),
-                rx.el.pre(
-                    State.spec,
-                    style={"fontSize": "12px", "margin": "0", "color": INK,
-                           "whiteSpace": "pre-wrap", "fontFamily": "ui-monospace, monospace"},
-                ),
-                spacing="2", width="100%",
-            ),
-        ),
         spacing="5", width="100%", align="stretch",
     )
 

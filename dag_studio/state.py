@@ -165,8 +165,6 @@ class State(rx.State):
     # --- model --------------------------------------------------------
     fitted: bool = False
     stale: bool = False  # graph edited since the last fit
-    spec: str = ""
-    fit_code: str = ""  # the BuildModelFromDAG call behind the current fit
     r2_rows: list[R2Row] = []
     fit_diagnostics: str = ""
     fit_warnings: list[str] = []
@@ -318,7 +316,6 @@ class State(rx.State):
         self.verdict = self.verdict_detail = self.violation_summary = ""
         self.picked = self.selected_edge = ""
         self.fitted = self.stale = self.has_curve = self.has_equation = False
-        self.spec = self.fit_code = ""
         self.curve_caption = self.equation_caption = self.evidence_caption = ""
         session = self._session()
         session.pop("model", None)
@@ -822,8 +819,7 @@ class State(rx.State):
         async with self:
             session["model"], session["curves"] = fit.model, {}
             session["equations"] = equations
-            self.fitted, self.stale, self.spec, self.busy = True, False, fit.spec, ""
-            self.fit_code = fit.code
+            self.fitted, self.stale, self.busy = True, False, ""
             self._set_quality(quality, target)
             self._refresh()
         return State.show_selected_edge
