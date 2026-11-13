@@ -64,6 +64,20 @@ class EquationRow:
     highlight: bool  # the term for the selected edge
 
 
+@dataclasses.dataclass
+class PriorRow:
+    """One editable prior number in the node panel."""
+
+    key: str  # backend.PriorParam.key
+    caption: str  # e.g. "Coefficients ~ Normal"; empty for the prior's second number
+    param: str  # e.g. "σ"
+    value: str  # what the user typed; empty means pathmc's default
+    default: str
+
+
+_SYMBOLS = {"mu": "μ", "sigma": "σ", "alpha": "α", "beta": "β"}
+
+
 def _short(name: str, limit: int = 13) -> str:
     return name if len(name) <= limit else name[: limit - 1] + "…"
 
@@ -84,6 +98,8 @@ class State(rx.State):
     flagged_edges: list[str] = []
     positions: dict[str, list[float]] = {}
     descriptions: dict[str, str] = {}  # node -> free-text note written by the user
+    families: dict[str, str] = {}  # node -> pathmc family; missing means gaussian
+    prior_text: dict[str, dict[str, str]] = {}  # node -> {PriorParam.key -> typed text}
 
     # --- selection ----------------------------------------------------
     picked: str = ""  # the selected node
@@ -101,6 +117,7 @@ class State(rx.State):
     fitted: bool = False
     stale: bool = False  # graph edited since the last fit
     spec: str = ""
+    fit_code: str = ""  # the BuildModelFromDAG call behind the current fit
     fig: go.Figure = go.Figure()
     has_curve: bool = False
     curve_caption: str = ""
@@ -181,9 +198,11 @@ class State(rx.State):
         self.nodes, self.removed, self.edges = list(self.columns), [], []
         self.flagged_nodes, self.flagged_edges = [], []
         self.positions, self.descriptions = {}, {}
+        self.families, self.prior_text = {}, {}
         self.picked = self.selected_edge = ""
         self.fitted = self.stale = self.has_curve = self.has_equation = False
-        self.spec = self.curve_caption = self.equation_caption = self.evidence_caption = ""
+        self.spec = self.fit_code = ""
+        self.curve_caption = self.equation_caption = self.evidence_caption = ""
         session = self._session()
         session.pop("model", None)
         session["evidence"], session["curves"] = {}, {}
@@ -208,7 +227,9 @@ class State(rx.State):
 
     @rx.var
     def problems(self) -> list[str]:
-        return b.graph_problems(self.nodes, self._edge_objects()) if self.nodes else []
+        if not self.nodes:
+            return []
+        return b.graph_problems(self.nodes, self._edge_objects(), self.target)
 
     @rx.var
     def can_fit(self) -> bool:
@@ -239,6 +260,31 @@ class State(rx.State):
     @rx.var
     def picked_flagged(self) -> bool:
         return self.picked in self.flagged_nodes
+
+    @rx.var
+    def picked_family(self) -> str:
+        return self.families.get(self.picked, "gaussian")
+
+    @rx.var
+    def picked_has_parents(self) -> bool:
+        return any(e["directed"] and e["target"] == self.picked for e in self.edges)
+
+    @rx.var
+    def picked_prior_rows(self) -> list[PriorRow]:
+        typed = self.prior_text.get(self.picked, {})
+        rows, seen = [], set()
+        for p in b.prior_params(self.families.get(self.picked, "gaussian")):
+            rows.append(
+                PriorRow(
+                    key=p.key,
+                    caption="" if p.prefix in seen else f"{p.label} ~ {p.dist}",
+                    param=_SYMBOLS.get(p.param, p.param),
+                    value=typed.get(p.key, ""),
+                    default=f"{p.default:g}",
+                )
+            )
+            seen.add(p.prefix)
+        return rows
 
     @rx.var
     def picked_description(self) -> str:
@@ -451,6 +497,51 @@ class State(rx.State):
         self.descriptions = descriptions
         self._refresh()
 
+    def _check_family(self, node: str, family: str) -> None:
+        df = self._session().get("df")
+        problems = b.family_problems(df, {node: family}) if df is not None else []
+        self.error = problems[0] if problems else ""
+
+    @rx.event
+    def set_family(self, family: str):
+        """Set the selected node's family. Applies at the next fit."""
+        node = self.picked
+        if not node or family not in b.FAMILIES:
+            return
+        families = dict(self.families)
+        if family == "gaussian":
+            families.pop(node, None)
+        else:
+            families[node] = family
+        if families != self.families:
+            self.families = families
+            self._graph_changed()
+            self._check_family(node, family)
+
+    @rx.event
+    def set_prior(self, key: str, text: str):
+        """Store one typed prior number for the selected node (blank = default)."""
+        node = self.picked
+        if not node:
+            return
+        typed = dict(self.prior_text.get(node, {}))
+        if text.strip():
+            typed[key] = text
+        else:
+            typed.pop(key, None)
+        prior_text = {n: v for n, v in self.prior_text.items() if n != node}
+        if typed:
+            prior_text[node] = typed
+        if prior_text != self.prior_text:
+            self.prior_text = prior_text
+            self._graph_changed()
+
+    @rx.event
+    def reset_priors(self):
+        if self.picked in self.prior_text:
+            self.prior_text = {n: v for n, v in self.prior_text.items() if n != self.picked}
+            self._graph_changed()
+
     @rx.event
     def remove_node(self):
         node = self.picked
@@ -499,9 +590,13 @@ class State(rx.State):
                 return
             self.busy, self.error = "Fitting the model with pathmc (MCMC)…", ""
             session, nodes, edges = self._session(), list(self.nodes), self._edge_objects()
+            target, families = self.target, dict(self.families)
+            priors = {n: dict(v) for n, v in self.prior_text.items()}
         try:
-            model, spec = await asyncio.to_thread(b.fit_model, session["df"], nodes, edges)
-            equations = await asyncio.to_thread(b.model_equations, model)
+            model, spec, code = await asyncio.to_thread(
+                b.fit_model, session["df"], nodes, edges, target, families, priors
+            )
+            equations = await asyncio.to_thread(b.model_equations, model, families)
         except Exception as exc:  # noqa: BLE001
             async with self:
                 self.busy, self.error = "", f"Fit failed: {exc}"
@@ -510,6 +605,7 @@ class State(rx.State):
             session["model"], session["curves"] = model, {}
             session["equations"] = equations
             self.fitted, self.stale, self.spec, self.busy = True, False, spec, ""
+            self.fit_code = code
         return State.show_selected_edge
 
     @rx.event(background=True)

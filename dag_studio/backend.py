@@ -77,11 +77,13 @@ def creates_cycle(edges: list[Edge], source: str, target: str) -> bool:
     return False
 
 
-def graph_problems(nodes: list[str], edges: list[Edge]) -> list[str]:
+def graph_problems(nodes: list[str], edges: list[Edge], target: str = "") -> list[str]:
     """Reasons the current graph cannot be fitted yet (empty list = ready)."""
     problems = []
     if not edges:
         problems.append("The graph has no edges.")
+    elif target and target not in {e.source for e in edges} | {e.target for e in edges}:
+        problems.append(f"The outcome {target} has no edges.")
     undirected = [e for e in edges if not e.directed]
     if undirected:
         names = ", ".join(f"{e.source}–{e.target}" for e in undirected[:4])
@@ -427,18 +429,182 @@ def edge_geometry(
 # --------------------------------------------------------------------------
 
 
-def fit_model(df: pl.DataFrame, nodes: list[str], edges: list[Edge]):
-    """Translate the DAG to a pathmc spec, build the model and run MCMC."""
-    import pathmc
+FAMILIES = ("gaussian", "studentt", "bernoulli", "poisson", "negbinomial")
 
-    problems = graph_problems(nodes, edges)
+
+@dataclass(frozen=True)
+class PriorParam:
+    """One editable number in a node's priors (pathmc parameter ``<prefix>_<node>``)."""
+
+    key: str  # id used in the UI, e.g. "beta.sigma"
+    prefix: str
+    label: str
+    dist: str
+    param: str
+    default: float  # pathmc's default
+    positive: bool
+
+
+PRIOR_PARAMS = (
+    PriorParam("beta.mu", "beta", "Coefficients", "Normal", "mu", 0.0, False),
+    PriorParam("beta.sigma", "beta", "Coefficients", "Normal", "sigma", 10.0, True),
+    PriorParam("sigma.sigma", "sigma", "Noise scale", "HalfNormal", "sigma", 1.0, True),
+    PriorParam("nu.alpha", "nu", "Degrees of freedom", "Gamma", "alpha", 2.0, True),
+    PriorParam("nu.beta", "nu", "Degrees of freedom", "Gamma", "beta", 0.1, True),
+    PriorParam("alpha_disp.sigma", "alpha_disp", "Dispersion", "HalfNormal", "sigma", 1.0, True),
+)
+
+
+def prior_params(family: str) -> list[PriorParam]:
+    """The priors a node with this family has. ``beta`` covers intercept and slopes."""
+    keep = {"beta"}
+    if family in ("gaussian", "studentt"):
+        keep.add("sigma")
+    if family == "studentt":
+        keep.add("nu")
+    if family == "negbinomial":
+        keep.add("alpha_disp")
+    return [p for p in PRIOR_PARAMS if p.prefix in keep]
+
+
+def prior_specs(
+    edges: list[Edge],
+    families: dict[str, str],
+    typed: dict[str, dict[str, str]],
+) -> dict[str, tuple[str, dict[str, float]]]:
+    """Turn the numbers typed per node into pathmc prior overrides.
+
+    ``typed`` maps node -> {PriorParam.key -> text}; a blank box means the
+    default. Only nodes with parents get priors (pathmc rejects the rest), and
+    a prior is only overridden when at least one of its numbers was typed.
+    Returns ``{"beta_y": ("Normal", {"mu": 0.0, "sigma": 2.0}), ...}``.
+    """
+    children = {e.target for e in edges if e.directed}
+    specs: dict[str, tuple[str, dict[str, float]]] = {}
+    for node in sorted(children):
+        entered = typed.get(node, {})
+        groups: dict[str, list[PriorParam]] = {}
+        for p in prior_params(families.get(node, "gaussian")):
+            groups.setdefault(p.prefix, []).append(p)
+        for prefix, group in groups.items():
+            if not any(entered.get(p.key, "").strip() for p in group):
+                continue
+            values: dict[str, float] = {}
+            for p in group:
+                text = entered.get(p.key, "").strip()
+                try:
+                    value = float(text) if text else p.default
+                except ValueError:
+                    raise ValueError(
+                        f"{node}: the {p.label.lower()} prior's {p.param} must be a number, "
+                        f"not '{text}'."
+                    ) from None
+                if not math.isfinite(value) or (p.positive and value <= 0):
+                    need = "a positive number" if p.positive else "a finite number"
+                    raise ValueError(
+                        f"{node}: the {p.label.lower()} prior's {p.param} must be {need}."
+                    )
+                values[p.param] = value
+            specs[f"{prefix}_{node}"] = (group[0].dist, values)
+    return specs
+
+
+def family_problems(df: pl.DataFrame, families: dict[str, str]) -> list[str]:
+    """Columns whose values the chosen family cannot model."""
+    problems = []
+    for node, family in sorted(families.items()):
+        if node not in df.columns:
+            continue
+        values = df[node].to_numpy()
+        if family == "bernoulli" and not np.isin(values, [0.0, 1.0]).all():
+            problems.append(f"{node} must contain only 0 and 1 to use the bernoulli family.")
+        if family in ("poisson", "negbinomial") and not (
+            (values >= 0) & (values == np.round(values))
+        ).all():
+            problems.append(
+                f"{node} must contain non-negative whole numbers to use the {family} family."
+            )
+    return problems
+
+
+def _fmt_number(value: float) -> str:
+    return f"{value:g}"
+
+
+def builder_code(
+    dag: str,
+    target: str,
+    families: dict[str, str],
+    priors: dict[str, tuple[str, dict[str, float]]],
+) -> str:
+    """The BuildModelFromDAG call that reproduces a fit (``df`` is the cleaned data)."""
+    lines = [
+        "builder = BuildModelFromDAG(",
+        f'    dag="{dag}",',
+        "    df=data,",
+        f'    target="{target}",',
+        '    style="native",',
+    ]
+    if families:
+        items = ", ".join(f'"{k}": "{v}"' for k, v in sorted(families.items()))
+        lines.append(f"    families={{{items}}},")
+    if priors:
+        lines.append("    priors={")
+        for name, (dist, params) in sorted(priors.items()):
+            args = ", ".join(f"{k}={_fmt_number(v)}" for k, v in params.items())
+            lines.append(f'        "{name}": Prior("{dist}", {args}),')
+        lines.append("    },")
+    lines.append(")")
+    return "\n".join(lines)
+
+
+def fit_model(
+    df: pl.DataFrame,
+    nodes: list[str],
+    edges: list[Edge],
+    target: str,
+    families: dict[str, str] | None = None,
+    priors: dict[str, dict[str, str]] | None = None,
+):
+    """Build the model with pathmc's ``BuildModelFromDAG`` (native style) and run MCMC.
+
+    ``families`` maps node -> family and ``priors`` maps node -> the numbers
+    typed in the UI (see :func:`prior_specs`). Settings for nodes without
+    parents, and "gaussian" (the default), are left out of the call.
+    Returns ``(model, spec, code)``: the fitted PathModel, its pathmc spec and
+    the equivalent ``BuildModelFromDAG`` call.
+    """
+    import pathmc
+    from pymc_extras.prior import Prior
+
+    problems = graph_problems(nodes, edges, target)
     if problems:
         raise ValueError(" ".join(problems))
 
+    children = {e.target for e in edges}
+    families = {
+        n: f for n, f in (families or {}).items() if n in children and f != "gaussian"
+    }
+    unknown = sorted(f for f in families.values() if f not in FAMILIES)
+    if unknown:
+        raise ValueError(f"Unknown family: {', '.join(unknown)}.")
+    problems = family_problems(df, families)
+    if problems:
+        raise ValueError(" ".join(problems))
+    specs = prior_specs(edges, families, priors or {})
+
     used = sorted({e.source for e in edges} | {e.target for e in edges})
-    dot = "digraph { " + " ".join(f"{e.source} -> {e.target};" for e in edges) + " }"
-    spec = pathmc.dag_to_spec(dot)
-    model = pathmc.model(spec, data=df.select(used).to_pandas())
+    dag = ", ".join(f"{e.source}->{e.target}" for e in edges)
+    builder = pathmc.BuildModelFromDAG(
+        dag=dag,
+        df=df.select(used).to_pandas(),
+        target=target,
+        style="native",
+        families=families or None,
+        priors={name: Prior(dist, **params) for name, (dist, params) in specs.items()} or None,
+    )
+    model = builder.to_pathmodel()
+    spec = pathmc.dag_to_spec(dag)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model.fit(
@@ -448,7 +614,7 @@ def fit_model(df: pl.DataFrame, nodes: list[str], edges: list[Edge]):
             progressbar=False,
             random_seed=RANDOM_SEED,
         )
-    return model, spec
+    return model, spec, builder_code(dag, target, families, specs)
 
 
 @dataclass
@@ -477,7 +643,9 @@ class Term:
 class Equation:
     """The fitted structural equation of one node.
 
-    ``node = intercept + sum(coef * parent) + noise``, noise ~ Normal(0, sigma).
+    The linear predictor ``intercept + sum(coef * parent)`` is the mean for
+    gaussian and studentt nodes, ``logit P(node = 1)`` for bernoulli and
+    ``log E[node]`` for poisson and negbinomial.
     """
 
     node: str
@@ -485,6 +653,9 @@ class Equation:
     terms: list[Term]  # one per parent, in the order pathmc reports them
     sigma: Term | None
     interval: str  # e.g. "89%"
+    family: str = "gaussian"
+    nu: Term | None = None  # studentt degrees of freedom
+    alpha: Term | None = None  # negbinomial dispersion
 
     def lines(self, highlight: str = "") -> list[tuple[str, str, bool]]:
         """Display rows: (expression, interval, is the ``highlight`` parent's term)."""
@@ -492,14 +663,30 @@ class Equation:
         def band(t: Term) -> str:
             return f"[{t.lower:.3f}, {t.upper:.3f}]"
 
-        rows = [(f"{self.node} = {self.intercept.mean:.3f}", band(self.intercept), False)]
+        lhs = {
+            "bernoulli": f"logit P({self.node} = 1)",
+            "poisson": f"log E[{self.node}]",
+            "negbinomial": f"log E[{self.node}]",
+        }.get(self.family, self.node)
+        rows = [(f"{lhs} = {self.intercept.mean:.3f}", band(self.intercept), False)]
         for t in self.terms:
             sign = "−" if t.mean < 0 else "+"
             rows.append((f"{sign} {abs(t.mean):.3f} · {t.name}", band(t), t.name == highlight))
-        if self.sigma is not None:
+        if self.family == "studentt" and self.sigma is not None and self.nu is not None:
+            rows.append(("+ ε,  ε ~ StudentT(ν, 0, σ)", "", False))
+            rows.append((f"    σ = {self.sigma.mean:.3f}", band(self.sigma), False))
+            rows.append((f"    ν = {self.nu.mean:.3f}", band(self.nu), False))
+        elif self.sigma is not None:
             rows.append(
                 (f"+ ε,  ε ~ Normal(0, {self.sigma.mean:.3f})", band(self.sigma), False)
             )
+        if self.family == "poisson":
+            rows.append((f"{self.node} ~ Poisson(E[{self.node}])", "", False))
+        if self.family == "negbinomial" and self.alpha is not None:
+            rows.append((
+                f"{self.node} ~ NegBinomial(E[{self.node}], α = {self.alpha.mean:.3f})",
+                band(self.alpha), False,
+            ))
         return rows
 
 
@@ -510,11 +697,13 @@ def _interval_columns(summary) -> tuple[str, str, str]:
     return lb, ub, f"{re.sub(r'[^0-9]', '', lb) or '?'}%"
 
 
-def model_equations(model) -> dict[str, Equation]:
+def model_equations(model, families: dict[str, str] | None = None) -> dict[str, Equation]:
     """Fitted equation for every node that has parents, from pathmc's summary.
 
-    Reads the ``beta_<node>[<parent or Intercept>]`` and ``sigma_<node>`` rows.
+    Reads the ``beta_<node>[<parent or Intercept>]`` rows, plus ``sigma_<node>``,
+    ``nu_<node>`` and ``alpha_disp_<node>`` where the node's family has them.
     """
+    families = families or {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         summary = model.summary()
@@ -533,13 +722,18 @@ def model_equations(model) -> dict[str, Equation]:
     equations = {}
     for node, terms in coefs.items():
         intercept = next((t for t in terms if t.name == "Intercept"), Term("Intercept", 0, 0, 0))
-        sigma = f"sigma_{node}"
+        def optional(name: str) -> Term | None:
+            return term(name, name) if name in summary.index else None
+
         equations[node] = Equation(
             node=node,
             intercept=intercept,
             terms=[t for t in terms if t.name != "Intercept"],
-            sigma=term(sigma, "sigma") if sigma in summary.index else None,
+            sigma=optional(f"sigma_{node}"),
             interval=level,
+            family=families.get(node, "gaussian"),
+            nu=optional(f"nu_{node}"),
+            alpha=optional(f"alpha_disp_{node}"),
         )
     return equations
 
@@ -664,9 +858,11 @@ def test_file_table(n: int = 600, seed: int = 11) -> pl.DataFrame:
         ad spend -> web visits, season -> web visits, season -> store visits,
         web visits -> orders, store visits -> orders, 2024 price index -> orders,
         orders -> revenue, 2024 price index -> revenue,
-        orders -> customer_satisfaction_score
+        orders -> customer_satisfaction_score,
+        customer_satisfaction_score -> repeat_purchase (0/1, logistic)
 
-    ``noise`` is unrelated to everything. Cleaning should rename two columns,
+    ``noise`` is unrelated to everything. ``repeat_purchase`` is for trying
+    the bernoulli family. Cleaning should rename two columns,
     ignore ``region`` (text) and ``tax_rate`` (constant), and drop the rows
     where ``web visits`` is missing.
     """
@@ -680,6 +876,8 @@ def test_file_table(n: int = 600, seed: int = 11) -> pl.DataFrame:
     revenue = 0.9 * orders + 0.4 * price + rng.normal(scale=0.8, size=n)
     satisfaction = 0.6 * orders + rng.normal(size=n)
     noise = rng.normal(size=n)
+    # Drawn last so the columns above match earlier versions of this file.
+    repeat = rng.random(n) < 1 / (1 + np.exp(-(0.3 + 1.2 * satisfaction)))
 
     web_visits = [None if i % 40 == 7 else float(v) for i, v in enumerate(web)]
     regions = ["north", "south", "east", "west"]
@@ -695,6 +893,7 @@ def test_file_table(n: int = 600, seed: int = 11) -> pl.DataFrame:
             "tax_rate": [0.2] * n,
             "customer_satisfaction_score": satisfaction.round(4),
             "noise": noise.round(4),
+            "repeat_purchase": repeat.astype(np.int64),
             "revenue": revenue.round(4),
         }
     )

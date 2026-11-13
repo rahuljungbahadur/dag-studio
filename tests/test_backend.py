@@ -1,5 +1,6 @@
 """Backend tests. The MCMC test is slow (~30 s); run `pytest -m "not slow"` to skip it."""
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -171,7 +172,11 @@ def test_fit_and_curve_recover_known_effect(monkeypatch):
         b.Edge("demand", "revenue"),
         b.Edge("price", "revenue"),
     ]
-    model, spec = b.fit_model(df, nodes, edges)
+    model, spec, code = b.fit_model(
+        df, nodes, edges, "revenue", priors={"revenue": {"beta.sigma": "5"}}
+    )
+    assert code.startswith("builder = BuildModelFromDAG(") and 'target="revenue"' in code
+    assert '"beta_revenue": Prior("Normal", mu=0, sigma=5),' in code
     assert "revenue ~ demand + price" in spec
 
     equations = b.model_equations(model)
@@ -192,5 +197,109 @@ def test_fit_and_curve_recover_known_effect(monkeypatch):
 
 
 def test_fit_refuses_invalid_graph():
+    df = b.demo_table()
     with pytest.raises(ValueError, match="Orient the dashed edges"):
-        b.fit_model(b.demo_table(), ["price", "demand"], [b.Edge("price", "demand", False)])
+        b.fit_model(df, ["price", "demand"], [b.Edge("price", "demand", False)], "demand")
+    with pytest.raises(ValueError, match="outcome revenue has no edges"):
+        b.fit_model(df, ["price", "demand", "revenue"], [b.Edge("price", "demand")], "revenue")
+    with pytest.raises(ValueError, match="only 0 and 1"):
+        b.fit_model(
+            df, ["price", "demand"], [b.Edge("price", "demand")], "demand",
+            families={"demand": "bernoulli"},
+        )
+
+
+def test_prior_params_follow_the_family():
+    keys = lambda family: [p.key for p in b.prior_params(family)]  # noqa: E731
+    assert keys("gaussian") == ["beta.mu", "beta.sigma", "sigma.sigma"]
+    assert keys("studentt") == ["beta.mu", "beta.sigma", "sigma.sigma", "nu.alpha", "nu.beta"]
+    assert keys("bernoulli") == keys("poisson") == ["beta.mu", "beta.sigma"]
+    assert keys("negbinomial") == ["beta.mu", "beta.sigma", "alpha_disp.sigma"]
+
+
+def test_prior_specs_fill_defaults_and_skip_root_nodes():
+    edges = [b.Edge("x", "m"), b.Edge("m", "y"), b.Edge("x", "y")]
+    typed = {
+        "y": {"beta.sigma": " 2 ", "sigma.sigma": ""},
+        "x": {"beta.sigma": "3"},  # x has no parents, so pathmc would reject this
+        "m": {"nu.alpha": "4"},  # m is gaussian, so it has no nu prior
+    }
+    assert b.prior_specs(edges, {}, typed) == {"beta_y": ("Normal", {"mu": 0.0, "sigma": 2.0})}
+    specs = b.prior_specs(edges, {"m": "studentt"}, typed)
+    assert specs["nu_m"] == ("Gamma", {"alpha": 4.0, "beta": 0.1})
+    with pytest.raises(ValueError, match="must be a number"):
+        b.prior_specs(edges, {}, {"y": {"beta.mu": "abc"}})
+    with pytest.raises(ValueError, match="must be a positive number"):
+        b.prior_specs(edges, {}, {"y": {"sigma.sigma": "-1"}})
+
+
+def test_family_problems():
+    df = pl.DataFrame({"flag": [0.0, 1.0, 1.0], "count": [0.0, 2.0, 5.0], "z": [0.5, -1.0, 2.0]})
+    ok = {"flag": "bernoulli", "count": "poisson"}
+    assert b.family_problems(df, ok) == []
+    bad = b.family_problems(df, {"z": "bernoulli", "flag": "negbinomial", "count": "studentt"})
+    assert len(bad) == 1 and "z must contain only 0 and 1" in bad[0]
+    assert b.family_problems(df, {"z": "poisson"})[0].startswith("z must contain non-negative")
+
+
+def test_builder_code():
+    code = b.builder_code(
+        "X->M, M->Y, X->Y", "Y", {"Y": "bernoulli"}, {"beta_Y": ("Normal", {"mu": 0.0, "sigma": 2.5})}
+    )
+    assert code == "\n".join([
+        "builder = BuildModelFromDAG(",
+        '    dag="X->M, M->Y, X->Y",',
+        "    df=data,",
+        '    target="Y",',
+        '    style="native",',
+        '    families={"Y": "bernoulli"},',
+        "    priors={",
+        '        "beta_Y": Prior("Normal", mu=0, sigma=2.5),',
+        "    },",
+        ")",
+    ])
+
+
+def test_equation_lines_for_other_families():
+    t = lambda name, mean: b.Term(name, mean, mean - 0.1, mean + 0.1)  # noqa: E731
+    logistic = b.Equation("y", t("Intercept", 0.1), [t("x", 0.6)], None, "89%", "bernoulli")
+    assert [r[0] for r in logistic.lines("x")] == ["logit P(y = 1) = 0.100", "+ 0.600 · x"]
+    robust = b.Equation(
+        "y", t("Intercept", 0.0), [t("x", -0.5)], t("sigma", 1.0), "89%", "studentt",
+        nu=t("nu", 4.0),
+    )
+    assert [r[0] for r in robust.lines()][2:] == [
+        "+ ε,  ε ~ StudentT(ν, 0, σ)", "    σ = 1.000", "    ν = 4.000",
+    ]
+    counts = b.Equation(
+        "n", t("Intercept", 1.0), [t("x", 0.2)], None, "89%", "negbinomial", alpha=t("a", 2.0)
+    )
+    assert counts.lines()[0][0] == "log E[n] = 1.000"
+    assert counts.lines()[-1][0] == "n ~ NegBinomial(E[n], α = 2.000)"
+
+
+@pytest.mark.slow
+def test_bernoulli_fit_through_builder(monkeypatch):
+    monkeypatch.setattr(b, "DRAWS", 200)
+    monkeypatch.setattr(b, "TUNE", 200)
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=500)
+    m = 0.8 * x + rng.normal(size=500)
+    y = (rng.random(500) < 1 / (1 + np.exp(-(0.5 * m + 0.7 * x)))).astype(float)
+    df = pl.DataFrame({"x": x, "m": m, "y": y})
+    edges = [b.Edge("x", "m"), b.Edge("m", "y"), b.Edge("x", "y")]
+    families = {"y": "bernoulli"}
+    model, _, code = b.fit_model(
+        df, ["x", "m", "y"], edges, "y", families, {"y": {"beta.sigma": "2"}}
+    )
+    assert 'families={"y": "bernoulli"},' in code
+
+    equations = b.model_equations(model, families)
+    assert equations["y"].sigma is None and equations["m"].sigma is not None
+    assert equations["y"].lines("x")[0][0].startswith("logit P(y = 1) = ")
+    slope = next(t for t in equations["y"].terms if t.name == "x")
+    assert slope.lower < 0.7 < slope.upper
+
+    curve = b.edge_curve(model, df, "x", "y")
+    assert all(0 <= v <= 1 for v in curve.mean)  # a probability
+    assert curve.mean[-1] > curve.mean[0]

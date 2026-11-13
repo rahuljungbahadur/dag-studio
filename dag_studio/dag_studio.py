@@ -5,7 +5,7 @@ from __future__ import annotations
 import reflex as rx
 
 from . import backend as b
-from .state import EdgeView, EquationRow, NodeView, State
+from .state import EdgeView, EquationRow, NodeView, PriorRow, State
 
 INK = "#1f2933"
 MUTED = "#7b8794"
@@ -13,6 +13,7 @@ LINE = "#e4e7eb"
 EDGE = "#9aa5b1"
 ACCENT = "#2563eb"
 AMBER = "#d97706"
+MONO = "ui-monospace, SFMono-Regular, Menlo, monospace"
 
 
 # --------------------------------------------------------------------------
@@ -279,6 +280,50 @@ def small_button(text, handler, **props) -> rx.Component:
     return rx.button(text, on_click=handler, size="1", **props)
 
 
+def prior_row(row: PriorRow) -> rx.Component:
+    return rx.hstack(
+        rx.text(row.caption, size="1", color=INK),
+        rx.spacer(),
+        rx.text(row.param, size="1", color=MUTED, style={"fontFamily": MONO}),
+        rx.input(
+            value=row.value, placeholder=row.default,
+            on_change=lambda text: State.set_prior(row.key, text),
+            size="1", width="84px",
+        ),
+        width="100%", align="center", spacing="2",
+    )
+
+
+def node_model_section() -> rx.Component:
+    return rx.vstack(
+        label("Model for this node"),
+        rx.cond(
+            State.picked_has_parents,
+            rx.vstack(
+                rx.hstack(
+                    rx.text("Family", size="1", color=INK),
+                    rx.spacer(),
+                    rx.select(list(b.FAMILIES), value=State.picked_family,
+                              on_change=State.set_family, size="1"),
+                    width="100%", align="center",
+                ),
+                rx.foreach(State.picked_prior_rows, prior_row),
+                hint(
+                    "Empty boxes use pathmc's default (shown in grey). The coefficient prior "
+                    "covers the intercept and every parent's slope. Changes apply at the next fit."
+                ),
+                small_button("Reset priors to defaults", State.reset_priors, variant="ghost"),
+                spacing="2", width="100%", align="stretch",
+            ),
+            hint(
+                "This node has no incoming edges, so it has no equation of its own: family "
+                "and priors only apply to nodes with parents."
+            ),
+        ),
+        spacing="2", width="100%", align="stretch", padding_top="8px",
+    )
+
+
 def node_details() -> rx.Component:
     return rx.vstack(
         label("Node"),
@@ -290,6 +335,7 @@ def node_details() -> rx.Component:
             size="1", rows="4", resize="vertical", width="100%",
         ),
         hint("Saved as you type. Shown when you hover the node and included in the DOT export."),
+        node_model_section(),
         rx.hstack(
             small_button(rx.cond(State.picked_flagged, "Unflag", "Flag for review"),
                          State.toggle_flag_node),
@@ -326,8 +372,6 @@ def edge_plot() -> rx.Component:
         ),
     )
 
-
-MONO = "ui-monospace, SFMono-Regular, Menlo, monospace"
 
 
 def equation_row(row: EquationRow) -> rx.Component:
@@ -398,6 +442,19 @@ def right_panel() -> rx.Component:
                     hint("Select a node or an edge in the graph."),
                     spacing="2",
                 ),
+            ),
+        ),
+        rx.cond(
+            State.fitted,
+            rx.vstack(
+                label("Fitted with"),
+                rx.el.pre(
+                    State.fit_code,
+                    style={"fontSize": "12px", "margin": "0", "color": INK,
+                           "whiteSpace": "pre-wrap", "fontFamily": MONO},
+                ),
+                hint("data is the cleaned table. Prior comes from pymc_extras.prior."),
+                spacing="2", width="100%",
             ),
         ),
         rx.cond(
