@@ -188,6 +188,7 @@ class State(rx.State):
     _violations: list[dict] = []
 
     # --- model --------------------------------------------------------
+    fit_snapshot: dict = {}  # what the last fit used (see backend.fit_snapshot); {} if none
     fitted: bool = False
     stale: bool = False  # graph edited since the last fit
     r2_rows: list[R2Row] = []
@@ -405,6 +406,7 @@ class State(rx.State):
         self.verdict = self.verdict_detail = self.violation_summary = ""
         self.selected_nodes, self.selected_edge = [], ""
         self.fitted = self.stale = self.has_curve = self.has_equation = False
+        self.fit_snapshot = {}
         self.curve_caption = self.equation_caption = self.evidence_caption = ""
         session = self._session()
         session.pop("model", None)
@@ -449,7 +451,7 @@ class State(rx.State):
 
     @rx.var
     def can_export_code(self) -> bool:
-        return self.n_rows > 0 and not self.problems
+        return bool(self.fit_snapshot)
 
     @rx.var
     def is_busy(self) -> bool:
@@ -667,6 +669,7 @@ class State(rx.State):
         session["curves"] = {}
         self.selected_nodes, self.selected_edge, self.refused_cycle = [], "", []
         self.fitted = self.stale = self.has_curve = self.has_equation = False
+        self.fit_snapshot = {}
         self.evidence_caption = ""
         self._violations, self.validated_sig, self.selected_violation = [], "", ""
         self.verdict = self.verdict_detail = self.violation_summary = ""
@@ -858,6 +861,7 @@ class State(rx.State):
             self.flagged_edges, self.refused_cycle = [], []
             self.selected_nodes, self.selected_edge = [], ""
             self.fitted = self.stale = self.has_curve = self.has_equation = False
+            self.fit_snapshot = {}
             self.evidence_caption = ""
             self._refresh(relayout=True)
             self.busy = self.progress_label = ""
@@ -1127,31 +1131,27 @@ class State(rx.State):
         self._refresh(relayout=True)
 
     def _export_script(self) -> str:
-        """The script that reproduces the current graph, settings and fit.
+        """The script for the DAG the model was last fitted on, with the settings it used.
 
-        Raises a ValueError that says what to fix if the graph cannot be fitted yet.
+        This is the fitted graph, not any edits made since. Raises a ValueError if
+        nothing has been fitted yet.
         """
-        edges = self._edge_objects()
-        plan = b.prepare_fit(
-            self._session()["df"], list(self.nodes), edges, self.target, dict(self.families),
-            {n: dict(v) for n, v in self.prior_text.items()}, self.grouped,
-        )
-        return export.build_script(
-            nodes=list(self.nodes), outcome=self.target, plan=plan, data_kind=self.data_kind,
-            data_file=self.filename, group_cols=list(self.group_cols), time_col=self.time_col,
-            alpha=float(self.alpha),
-        )
+        if not self.fit_snapshot:
+            raise ValueError(
+                "Fit the model first: the script is for the DAG the model was last fitted on."
+            )
+        return export.build_script(self.fit_snapshot)
 
     @rx.event
     def export_code(self):
-        """Download a Python script that reproduces this analysis."""
+        """Download a Python script that refits the DAG the model was last fitted on."""
         try:
             script = self._export_script()
         except ValueError as exc:
             self.error = f"Could not export the code: {exc}"
             return
         self.error = ""
-        return rx.download(data=script, filename="dag_studio_analysis.py")
+        return rx.download(data=script, filename="dag_studio_model.py")
 
     @rx.event
     def export_dot(self):
@@ -1175,6 +1175,7 @@ class State(rx.State):
             target, families = self.target, dict(self.families)
             priors = {n: dict(v) for n, v in self.prior_text.items()}
             grouped = self.grouped
+            where = (list(self.group_cols), self.time_col, self.data_kind, self.filename)
         progress = b.Progress()
 
         async def work():
@@ -1200,6 +1201,7 @@ class State(rx.State):
             session["model"], session["curves"] = fit.model, {}
             session["equations"] = equations
             self.fitted, self.stale = True, False
+            self.fit_snapshot = b.fit_snapshot(fit.plan, target, *where)
             self.busy = self.progress_label = ""
             self._set_quality(quality, target)
             self._refresh()

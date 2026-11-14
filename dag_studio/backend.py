@@ -1405,7 +1405,34 @@ def fit_model(
             progressbar=False,
             random_seed=RANDOM_SEED,
         )
-    return FitResult(model, idata, spec, builder_code(dag, target, families, specs), families)
+    return FitResult(
+        model, idata, spec, builder_code(dag, target, families, specs), families, plan
+    )
+
+
+def fit_snapshot(
+    plan: FitPlan,
+    outcome: str,
+    group_columns: list[str],
+    time_column: str,
+    data_kind: str,
+    data_file: str,
+) -> dict:
+    """What a fit used, in plain types, so the app can remember it and export it later."""
+    return {
+        "pairs": [list(pair) for pair in plan.pairs],
+        "families": dict(plan.families),
+        "specs": {name: [dist, dict(params)] for name, (dist, params) in plan.specs.items()},
+        "outcome": outcome,
+        "group_columns": list(group_columns),
+        "time_column": time_column,
+        "data_kind": data_kind,  # "file", or "demo" for the built-in data
+        "data_file": data_file,
+        "draws": DRAWS,
+        "tune": TUNE,
+        "chains": CHAINS,
+        "seed": RANDOM_SEED,
+    }
 
 
 @dataclass
@@ -1415,6 +1442,7 @@ class FitResult:
     spec: str
     code: str  # the equivalent BuildModelFromDAG call
     families: dict[str, str]  # non-gaussian families actually used
+    plan: FitPlan | None = None  # what the fit used: the graph, families and priors
 
 
 # --------------------------------------------------------------------------

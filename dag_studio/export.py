@@ -1,13 +1,12 @@
-"""Export the current analysis as a standalone Python script.
+"""Export the DAG the model was last fitted on as a short, standalone Python script.
 
-The script is meant to reproduce what the app shows: it loads the data the way the
-app did, loads the DAG from a digraph, fits it with pathmc's ``BuildModelFromDAG``
-with the same settings and seed, and prints and saves the same results.
+The script loads the data with polars from a path the user must set, loads the DAG as
+a digraph, and fits it with pathmc's ``BuildModelFromDAG`` with the settings and seed
+the app used, assigning the model to variables in the ``__main__`` section.
 
-To make "the same" literally true, the functions that do the app's work (cleaning,
-grouping, equations, R², effect curves, validation) are copied into the script from
-this package's source at export time, so there is one version of that code and the
-script cannot drift from the app. The script imports no DAG Studio code.
+The few functions that prepare the data (cleaning, and removing group means for panel
+data) are copied into the script from this package's source at export time, so the
+script prepares the data with the same code the app did and imports no DAG Studio code.
 """
 
 from __future__ import annotations
@@ -20,29 +19,9 @@ from importlib import metadata
 
 from . import backend as b
 
-# What the script needs from the app, in an order where each piece only uses earlier ones.
-HELPERS_DATA = [
-    b._safe_name, b.clean_table_with_extras, b.load_dataset,
-    b.GroupSummary, b.GroupedData, b.apply_grouping,
-]
-HELPERS_GRAPH = [b.Edge, b.edge_key, b.directed_path, b.creates_cycle]
-HELPERS_RESULTS = [
-    b.Term, b.Equation, b._interval_columns, b.model_equations, b.edge_effects, b.edge_tooltip,
-    b.FitResult, b.NodeFit, b.FitQuality, b.QualityRow, b.r2_text, b.quality_rows,
-    b.quality_diagnostics, b._draws, b.bayes_r2, b.fit_quality,
-    b.Curve, b.edge_curve, b.make_figure,
-]
-HELPERS_VALIDATION = [
-    b.Violation, b.Validation, b.violation_given, b.violation_stats, b.validation_summary,
-    b.dag_to_spec_from_edges, b._falsify_verdict, b.validate_graph,
-]
-CONSTANTS = [
-    "INTERVAL", "GRID_POINTS", "MAX_SCATTER", "RANDOM_SEED", "RHAT_GOOD", "RHAT_BAD", "ESS_MIN",
-    "SHORT_GROUP_ROWS", "CONVERGED_NOTE", "R2_HEADING", "R2_HEADING_GROUPED",
-]
 PACKAGES = [
     "pathmc", "pymc", "pymc-extras", "nutpie", "polars", "pyarrow", "pandas", "numpy",
-    "networkx", "arviz", "plotly", "narwhals",
+    "networkx",
 ]
 
 
@@ -61,21 +40,6 @@ def _source(objects) -> str:
     return "\n\n\n".join(textwrap.dedent(inspect.getsource(o)).rstrip() for o in objects)
 
 
-def _constants() -> str:
-    return "\n".join(f"{name} = {getattr(b, name)!r}" for name in CONSTANTS)
-
-
-def _format_priors(specs: dict[str, tuple[str, dict[str, float]]]) -> str:
-    if not specs:
-        return "PRIORS = {}"
-    lines = ["PRIORS = {"]
-    for name, (dist, params) in sorted(specs.items()):
-        args = ", ".join(f"{k}={b._fmt_number(v)}" for k, v in params.items())
-        lines.append(f'    "{name}": Prior("{dist}", {args}),')
-    lines.append("}")
-    return "\n".join(lines)
-
-
 def _format_list(values: list[str]) -> str:
     """A Python list of strings, wrapped if it is long."""
     quoted = [json.dumps(v) for v in values]
@@ -86,313 +50,174 @@ def _format_list(values: list[str]) -> str:
     return "[\n" + body + ",\n]"
 
 
-def _load_data(kind: str) -> str:
-    if kind == "demo":
-        read = '''    table, notes, extras = demo_table(), [], pl.DataFrame()'''
-    else:
-        read = '''    path = Path(DATA_FILE)
-    if not path.exists():
-        sys.exit(f"Data file not found: {path.resolve()}\\nPut {DATA_FILE} in this folder, "
-                 "or change DATA_FILE at the top of the script.")
-    table, notes, extras = load_dataset(path)  # numeric columns, cleaned as in the app'''
-    return f'''def load_data():
-    """The table the app analysed: cleaned, then (if grouped) with group means removed."""
-{read}
-    if GROUP_COLUMNS:
-        frame = table.hstack(extras) if extras.width else table
-        grouped = apply_grouping(frame, GROUP_COLUMNS, TIME_COLUMN, list(table.columns))
-        return grouped.df, notes, grouped.summary
-    if TIME_COLUMN and TIME_COLUMN in table.columns:
-        table = table.drop(TIME_COLUMN)
-    return table, notes, None'''
+def _format_priors(specs: dict[str, list]) -> str:
+    if not specs:
+        return "PRIORS = {}"
+    lines = ["PRIORS = {"]
+    for name, (dist, params) in sorted(specs.items()):
+        args = ", ".join(f"{k}={b._fmt_number(v)}" for k, v in params.items())
+        lines.append(f'    "{name}": Prior("{dist}", {args}),')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+_LOAD_DAG = '''def load_dag(text: str) -> nx.DiGraph:
+    """The digraph above as a networkx graph.
+
+    pathmc reads a digraph string in an order that changes from run to run, which can
+    change the order of the equations and so the sampler's random numbers. Adding the
+    edges in sorted order gives the same model, and the same fit, every time.
+    """
+    graph = nx.DiGraph()
+    graph.add_edges_from(sorted(re.findall(r'"([^"]+)"\\s*->\\s*"([^"]+)"', text)))
+    return graph'''
 
 
 def build_script(
-    *,
-    nodes: list[str],
-    outcome: str,
-    plan: b.FitPlan,
-    data_kind: str,
-    data_file: str,
-    group_cols: list[str],
-    time_col: str,
-    alpha: float,
-    generated_at: str | None = None,
+    snapshot: dict, *, generated_at: str | None = None, data_path: str | None = None
 ) -> str:
-    """The script text. ``plan`` is :func:`backend.prepare_fit`'s answer for the same graph."""
+    """The script for a fit, from :func:`backend.fit_snapshot`.
+
+    ``data_path`` is for tests and notebooks. The app leaves it out, so the script
+    carries a placeholder that its user must replace with the path to their file.
+    """
     when = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M")
-    if data_kind == "demo":
-        data_note = "the built-in demo data, generated by the code below"
-        data_line = ""
-        data_label = "demo data"
+    pairs = [tuple(pair) for pair in snapshot["pairs"]]
+    used = sorted({node for pair in pairs for node in pair})
+    dag = b.to_dot(used, [b.Edge(u, v) for u, v in pairs]).rstrip("\n")
+    outcome, demo = snapshot["outcome"], snapshot["data_kind"] == "demo"
+    group_cols, time_col = snapshot["group_columns"], snapshot["time_column"]
+    data_file, specs = snapshot["data_file"], snapshot["specs"]
+    grouped = bool(group_cols)
+    parquet = data_file.lower().endswith((".parquet", ".pq"))
+
+    # ---- imports: only what this script uses ---------------------------------------
+    stdlib = ["import re"]
+    if grouped:
+        stdlib.append("from dataclasses import dataclass")
+    if not demo:
+        stdlib.append("from pathlib import Path")
+    third_party = ["import networkx as nx"]
+    if demo:
+        third_party.append("import numpy as np")
+    third_party += ["import polars as pl", "from pathmc import BuildModelFromDAG"]
+    if specs:
+        third_party.append("from pymc_extras.prior import Prior")
+
+    # ---- settings ----------------------------------------------------------------------
+    settings = [f"OUTCOME = {json.dumps(outcome)}"]
+    if grouped:
+        settings.append(
+            f"GROUP_COLUMNS = {_format_list(group_cols)}  # together they name one group"
+        )
+    if time_col:
+        settings.append(f"TIME_COLUMN = {json.dumps(time_col)}  # kept out of the graph")
+    settings += [
+        "FAMILIES = " + json.dumps(dict(sorted(snapshot["families"].items()))),
+        _format_priors(specs),
+        "DRAWS, TUNE, CHAINS, SEED = "
+        f"{snapshot['draws']}, {snapshot['tune']}, {snapshot['chains']}, {snapshot['seed']}",
+    ]
+
+    # ---- the functions that prepare the data: copied from the app ------------------------
+    helpers = [b.demo_table] if demo else [b._safe_name, b.clean_table_with_extras]
+    helper_text = ""
+    if grouped:
+        helper_text = "SHORT_GROUP_ROWS = %r\n\n\n" % b.SHORT_GROUP_ROWS
+        helpers += [b.GroupSummary, b.GroupedData, b.apply_grouping]
+    helper_text += _source(helpers)
+
+    # ---- __main__ ------------------------------------------------------------------------
+    if demo:
+        load = [
+            "    # DAG Studio's built-in demo data, generated here: there is no file to load.",
+            "    table = demo_table()",
+        ]
+        if grouped:
+            load.append("    extras = pl.DataFrame()  # the demo data has no text columns")
+        data_note = "DAG Studio's built-in demo data (generated in the script)"
     else:
-        data_note = f"{data_file} (put it in the same folder as this script)"
-        data_line = f"DATA_FILE = {json.dumps(data_file)}\n"
-        data_label = data_file
-    dot = b.to_dot(plan.used, [b.Edge(u, v) for u, v in plan.pairs])
-    helpers = HELPERS_DATA + [b.demo_table] if data_kind == "demo" else HELPERS_DATA
+        reader = "pl.read_parquet(data_path)" if parquet else (
+            "pl.read_csv(data_path, infer_schema_length=10_000)"
+        )
+        placeholder = data_path if data_path is not None else f"path/to/{data_file}"
+        load = [
+            f"    # REQUIRED: the path to the data file you loaded in DAG Studio ({data_file}).",
+            f"    data_path = {json.dumps(placeholder)}",
+            "    if not Path(data_path).is_file():",
+            '        raise SystemExit(f"Set data_path in the __main__ section: no file at {data_path!r}.")',
+            "",
+            "    # Load it with polars and prepare it as DAG Studio did: numeric columns, tidy names,",
+            "    # no constant columns, complete rows.",
+            f"    raw = {reader}",
+            "    table, _, extras = clean_table_with_extras(raw)",
+        ]
+        data_note = f"{data_file} (set data_path in the __main__ section)"
+    if grouped:
+        prepare = [
+            "    # Panel data: remove each group's mean, so only differences within a group remain.",
+            "    frame = table.hstack(extras) if extras.width else table",
+            "    data = apply_grouping(frame, GROUP_COLUMNS, TIME_COLUMN, list(table.columns)).df",
+        ]
+    elif time_col:
+        prepare = ["    data = table.drop(TIME_COLUMN, strict=False)  # a time index is not a variable"]
+    else:
+        prepare = ["    data = table"]
 
-    script = _TEMPLATE
-    for token, value in {
-        "@@WHEN@@": when,
-        "@@DATA_NOTE@@": data_note,
-        "@@OUTCOME@@": outcome,
-        "@@REQUIREMENTS@@": requirements(),
-        "@@DATA_LINE@@": data_line,
-        "@@DATA_LABEL@@": json.dumps(data_label),
-        "@@GROUP_COLUMNS@@": _format_list(list(group_cols)),
-        "@@TIME_COLUMN@@": json.dumps(time_col),
-        "@@NODES@@": _format_list(nodes),
-        "@@DRAWS@@": f"{b.DRAWS}, {b.TUNE}, {b.CHAINS}, {b.RANDOM_SEED}",
-        "@@ALPHA@@": repr(alpha),
-        "@@FAMILIES@@": "FAMILIES = " + json.dumps(dict(sorted(plan.families.items()))),
-        "@@PRIORS@@": _format_priors(plan.specs),
-        "@@DOT@@": dot.rstrip("\n"),
-        "@@LOAD_DATA@@": _load_data(data_kind),
-        "@@CONSTANTS@@": _constants(),
-        "@@HELPERS_DATA@@": _source(helpers),
-        "@@HELPERS_GRAPH@@": _source(HELPERS_GRAPH),
-        "@@HELPERS_RESULTS@@": _source(HELPERS_RESULTS),
-        "@@HELPERS_VALIDATION@@": _source(HELPERS_VALIDATION),
-    }.items():
-        script = script.replace(token, value)
-    if "@@" in script:
-        raise RuntimeError("The script template has an unfilled placeholder.")
-    return script
+    main = "\n".join(
+        ["if __name__ == \"__main__\":", *load, "", *prepare, "",
+         "    # The DAG the model was last fitted on, and the model fitted on it.",
+         "    graph = load_dag(DAG)",
+         "    builder = BuildModelFromDAG(",
+         "        dag=graph,",
+         "        df=data.select(sorted(graph.nodes)).to_pandas(),",
+         "        target=OUTCOME,",
+         '        style="native",',
+         "        families=FAMILIES or None,",
+         "        priors=PRIORS or None,",
+         "    )",
+         "    model = builder.to_pathmodel()",
+         "    idata = model.fit(draws=DRAWS, tune=TUNE, chains=CHAINS, progressbar=False, "
+         "random_seed=SEED)",
+         "",
+         "    # The fitted parameters, without the per-row fitted means.",
+         "    summary = model.summary()",
+         '    print(summary[~summary.index.str.startswith(("mu_", "pathmc_resp_"))])']
+    )
 
+    return f'''"""The model DAG Studio last fitted, as code (generated {when}).
 
-_TEMPLATE = '''#!/usr/bin/env python3
-"""DAG Studio analysis, as a script (generated @@WHEN@@).
+The digraph below is the DAG the model was last fitted on. Run this file, or paste it into
+a notebook: afterwards `model` is the fitted pathmc model and `idata` its posterior.
 
-Fits the model you fitted in DAG Studio and prints and saves what the app shows: the
-data summary, Validate DAG, fit quality, every fitted equation, the direct effects and
-the effect curves E[child | do(parent)].
-
-    Data     @@DATA_NOTE@@
-    Outcome  @@OUTCOME@@
+    Data     {data_note}
+    Outcome  {outcome}
 
 Install (the versions this was exported from):
 
-    pip install @@REQUIREMENTS@@
-
-Run:
-
-    python dag_studio_analysis.py
-
-Results go to dag_studio_output/: results.json holds every number, effect_curves.csv the
-curves, and there is one effect_*.html plot per edge and per node (they load Plotly from a
-CDN). Sampling is seeded, so a run matches the app to the precision the app displays.
+    pip install {requirements()}
 """
 
 from __future__ import annotations
 
-import json
-import re
-import sys
-import warnings
-from dataclasses import asdict, dataclass
-from pathlib import Path
+{chr(10).join(stdlib)}
 
-import networkx as nx
-import numpy as np
-import pandas as pd
-import polars as pl
-from pathmc import BuildModelFromDAG
-from pymc_extras.prior import Prior
+{chr(10).join(third_party)}
 
-# =============================================================================
-# Settings
-# =============================================================================
+# The DAG the model was fitted on, as a digraph.
+DAG = """{dag}"""
 
-@@DATA_LINE@@OUTCOME = "@@OUTCOME@@"
-GROUP_COLUMNS = @@GROUP_COLUMNS@@  # the columns that name a group; [] if rows are independent
-TIME_COLUMN = @@TIME_COLUMN@@  # kept out of the graph; "" for none
-DRAWS, TUNE, CHAINS, SEED = @@DRAWS@@  # MCMC settings, as in the app
-ALPHA = @@ALPHA@@  # significance level for Validate DAG
-RUN_VALIDATION = True  # test the graph against the data before fitting
-MAKE_PLOTS = True  # compute and save the effect curves (the slowest step)
-OUTPUT_DIR = Path("dag_studio_output")
-DATA_LABEL = @@DATA_LABEL@@
-
-# Every variable that was in the graph, including any with no edges (Validate DAG tests them).
-NODES = @@NODES@@
-
-# Model settings from the node panels: families other than gaussian, and prior overrides.
-@@FAMILIES@@
-@@PRIORS@@
-
-# =============================================================================
-# The DAG, as a digraph
-# =============================================================================
-
-DAG = """@@DOT@@"""
+# What DAG Studio fitted it with.
+{chr(10).join(settings)}
 
 
-# =============================================================================
-# The analysis
-# =============================================================================
+{_LOAD_DAG}
 
 
-def main() -> None:
-    warnings.simplefilter("ignore")
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    results: dict = {}
-
-    # 1. The data, prepared exactly as the app prepared it.
-    data, notes, grouping = load_data()
-    section("Data")
-    detail = " (group means removed)" if GROUP_COLUMNS else ""
-    print(f"{DATA_LABEL} · {data.height} rows · {data.width} variables{detail}")
-    for note in notes:
-        print(note)
-    if grouping is not None:
-        print(grouping.headline)
-        for warning in grouping.warnings:
-            print(warning)
-
-    # 2. The DAG: the digraph above, as a networkx graph.
-    graph = load_dag(DAG)
-    edges = [Edge(u, v) for u, v in sorted(graph.edges)]
-
-    # 3. Validate DAG: does the data contradict the graph? (No fit needed.)
-    if RUN_VALIDATION:
-        section("Validate DAG")
-        check = validate_graph(data, NODES, edges, ALPHA)
-        print(check.verdict)
-        print(check.detail)
-        print(validation_summary(check))
-        for v in check.violations:
-            print(f"  {v.x} — {v.y}  {violation_given(v.given)}  "
-                  f"{violation_stats(v.partial_corr, v.p_value)}")
-        results["validation"] = {**asdict(check), "expected_by_chance": check.expected_by_chance}
-
-    # 4. Fit the model with pathmc.
-    builder = BuildModelFromDAG(
-        dag=graph,
-        df=data.select(sorted(graph.nodes)).to_pandas(),
-        target=OUTCOME,
-        style="native",
-        families=FAMILIES or None,
-        priors=PRIORS or None,
-    )
-    model = builder.to_pathmodel()
-    idata = model.fit(draws=DRAWS, tune=TUNE, chains=CHAINS, progressbar=False, random_seed=SEED)
-
-    # 5. What the app shows after a fit.
-    quality = fit_quality(FitResult(model, idata, "", "", FAMILIES))
-    equations = model_equations(model, FAMILIES)
-    results["settings"] = {"draws": DRAWS, "tune": TUNE, "chains": CHAINS, "seed": SEED,
-                           "outcome": OUTCOME, "group_columns": GROUP_COLUMNS}
-    results["diagnostics"] = {"max_rhat": quality.max_rhat, "min_ess": quality.min_ess,
-                              "divergences": quality.divergences}
-
-    section("Fit quality")
-    print(quality_diagnostics(quality, CHAINS, DRAWS))
-    problems = quality.warnings()
-    for problem in problems:
-        print(problem)
-    if not problems:
-        print(CONVERGED_NOTE)
-    print("\\n" + (R2_HEADING_GROUPED if GROUP_COLUMNS else R2_HEADING))
-    for row in quality_rows(quality, OUTCOME):
-        print(f"  {row.node:<30}{row.family:<13}{row.r2:>5}  {row.interval}")
-    results["r2"] = {n.node: asdict(n) for n in quality.nodes}
-    r2_by_node = {n.node: r2_text(n) for n in quality.nodes}
-
-    section("Fitted equations")
-    print(f"Posterior means, with {round(INTERVAL * 100)}% intervals on the right.")
-    if GROUP_COLUMNS:
-        print("Group means were removed first, so the slopes are within-group effects and the "
-              "intercept is near 0.")
-    for node in nx.topological_sort(graph):
-        equation = equations.get(node)
-        if equation is None:
-            continue
-        suffix = f"   (R² = {r2_by_node[node]})" if node in r2_by_node else ""
-        print(f"\\n{node}{suffix}")
-        for expression, band, _ in equation.lines():
-            print(f"  {expression:<48}{band}")
-    results["equations"] = {node: asdict(eq) for node, eq in equations.items()}
-
-    section("Direct effects (the colours the app draws on the edges)")
-    meaning = {"pos": "raises its child", "neg": "lowers its child",
-               "pos_weak": f"raises its child, but the {round(INTERVAL * 100)}% interval includes 0",
-               "neg_weak": f"lowers its child, but the {round(INTERVAL * 100)}% interval includes 0"}
-    effects = edge_effects(equations, edges)
-    results["direct_effects"] = []
-    for edge in edges:
-        if edge.key not in effects:
-            continue
-        sign, term = effects[edge.key]
-        print(f"  {edge_tooltip(edge.source, edge.target, True, term)}  — {meaning[sign]}")
-        results["direct_effects"].append({"source": edge.source, "target": edge.target,
-                                          "sign": sign, **asdict(term)})
-
-    # 6. E[child | do(parent)] for every edge, and E[outcome | do(node)] for every node.
-    if MAKE_PLOTS:
-        section("Effect curves, E[child | do(parent)]")
-        curves = []
-        for source, target in effect_pairs(graph, OUTCOME):
-            curve = edge_curve(model, data, source, target)
-            figure = make_figure(curve, data, bool(GROUP_COLUMNS))
-            figure.write_html(OUTPUT_DIR / f"effect_{source}_on_{target}.html",
-                              include_plotlyjs="cdn")
-            curves.append(pd.DataFrame({"source": source, "target": target, "x": curve.x,
-                                        "mean": curve.mean, "lower": curve.lower,
-                                        "upper": curve.upper}))
-            print(f"  E[{target} | do({source})]: {curve.mean[0]:.3f} to {curve.mean[-1]:.3f} "
-                  f"as {source} goes from {curve.x[0]:.2f} to {curve.x[-1]:.2f}")
-        if curves:
-            pd.concat(curves).to_csv(OUTPUT_DIR / "effect_curves.csv", index=False)
-
-    (OUTPUT_DIR / "results.json").write_text(json.dumps(results, indent=2))
-    print(f"\\nWrote {OUTPUT_DIR}/ (results.json" + (", effect_curves.csv, effect_*.html)" if MAKE_PLOTS else ")"))
+# The functions below prepare the data. They are copied from DAG Studio's own source, so the
+# data is prepared exactly as it was in the app.
+{helper_text}
 
 
-def section(title: str) -> None:
-    print(f"\\n== {title} ==")
-
-
-def load_dag(text: str) -> nx.DiGraph:
-    """The digraph above as a networkx graph. Edges go in sorted order, so pathmc builds the
-    equations the same way every run (and the way the app did)."""
-    graph = nx.DiGraph()
-    graph.add_edges_from(sorted(re.findall(r'"([^"]+)"\\s*->\\s*"([^"]+)"', text)))
-    return graph
-
-
-def effect_pairs(graph: nx.DiGraph, outcome: str) -> list[tuple[str, str]]:
-    """Each edge (parent, child), then each node's effect on the outcome, as the app shows them."""
-    pairs = sorted(graph.edges)
-    for node in sorted(graph.nodes):
-        if node != outcome and nx.has_path(graph, node, outcome) and (node, outcome) not in pairs:
-            pairs.append((node, outcome))
-    return pairs
-
-
-@@LOAD_DATA@@
-
-
-# =============================================================================
-# Helpers: copied from DAG Studio's own source when this script was exported, so the
-# numbers match the app. Nothing below needs changing.
-# =============================================================================
-
-@@CONSTANTS@@
-
-
-@@HELPERS_DATA@@
-
-
-@@HELPERS_GRAPH@@
-
-
-@@HELPERS_RESULTS@@
-
-
-@@HELPERS_VALIDATION@@
-
-
-if __name__ == "__main__":
-    main()
+{main}
 '''

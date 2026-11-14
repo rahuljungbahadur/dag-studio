@@ -1,14 +1,14 @@
-"""The exported script: what it contains, and that it reproduces the app's numbers."""
+"""Export code: a short script for the DAG the model was last fitted on."""
 
 import ast
+import asyncio
 import builtins
-import csv
-import json
 import re
-import shutil
 import subprocess
 import sys
+from pathlib import Path
 
+import pandas as pd
 import polars as pl
 import pytest
 
@@ -21,17 +21,36 @@ DEMO_EDGES = [
     b.Edge("season", "promo"), b.Edge("season", "demand"), b.Edge("promo", "demand"),
     b.Edge("price", "demand"), b.Edge("demand", "revenue"), b.Edge("price", "revenue"),
 ]
+PANEL_EDGES = [
+    b.Edge("price", "demand"), b.Edge("promo", "demand"), b.Edge("demand", "revenue"),
+    b.Edge("price", "revenue"),
+]
 
 
-def demo_script(**overrides) -> str:
-    df = b.demo_table()
-    plan = b.prepare_fit(df, DEMO_NODES, DEMO_EDGES, "revenue",
-                         priors={"revenue": {"beta.sigma": "5"}})
-    settings = dict(
-        nodes=DEMO_NODES, outcome="revenue", plan=plan, data_kind="demo", data_file="",
-        group_cols=[], time_col="", alpha=0.05, generated_at="2026-01-02 03:04",
+def demo_snapshot(**changes) -> dict:
+    plan = b.prepare_fit(
+        b.demo_table(), DEMO_NODES, DEMO_EDGES, "revenue", priors={"revenue": {"beta.sigma": "5"}}
     )
-    return export.build_script(**{**settings, **overrides})
+    snapshot = b.fit_snapshot(plan, "revenue", [], "", "demo", "demo data")
+    return {**snapshot, **changes}
+
+
+def file_snapshot(file="sales 2026.csv", **changes) -> dict:
+    return demo_snapshot(data_kind="file", data_file=file, **changes)
+
+
+def panel_data():
+    df, _, extras = b.load_dataset(b.PANEL_TEST_FILE)
+    grouped = b.apply_grouping(df.hstack(extras), ["region", "store"], "week", list(df.columns))
+    return grouped.df
+
+
+def panel_snapshot() -> dict:
+    data = panel_data()
+    plan = b.prepare_fit(data, data.columns, PANEL_EDGES, "revenue", grouped=True)
+    return b.fit_snapshot(
+        plan, "revenue", ["region", "store"], "week", "file", b.PANEL_TEST_FILE.name
+    )
 
 
 def undefined_names(source: str) -> set[str]:
@@ -53,112 +72,102 @@ def undefined_names(source: str) -> set[str]:
     return loaded - bound
 
 
-# --------------------------------------------------------------------------
-# What the fit takes from the app's settings
-# --------------------------------------------------------------------------
-
-
-def test_prepare_fit_sorts_the_edges_so_a_graph_always_fits_the_same_way():
-    df = b.demo_table()
-    shuffled = [DEMO_EDGES[i] for i in (4, 1, 5, 0, 3, 2)]
-    a = b.prepare_fit(df, DEMO_NODES, DEMO_EDGES, "revenue")
-    c = b.prepare_fit(df, DEMO_NODES, shuffled, "revenue")
-    assert a.dag == c.dag == (
-        "demand->revenue, price->demand, price->revenue, promo->demand, season->demand, "
-        "season->promo"
-    )
-    assert a.pairs == c.pairs and a.used == ["demand", "price", "promo", "revenue", "season"]
-
-
-def test_prepare_fit_keeps_only_what_the_fit_will_use():
-    df = b.demo_table().with_columns((pl.col("promo") > 0).cast(pl.Float64).alias("flag"))
-    edges = DEMO_EDGES + [b.Edge("price", "flag")]
-    plan = b.prepare_fit(
-        df, DEMO_NODES + ["flag"], edges, "revenue",
-        families={"flag": "bernoulli", "season": "poisson", "demand": "gaussian"},
-        priors={"flag": {"beta.sigma": "2"}, "season": {"beta.sigma": "9"}},
-    )
-    # season has no parents, and gaussian is the default: neither is kept.
-    assert plan.families == {"flag": "bernoulli"}
-    assert plan.specs == {"beta_flag": ("Normal", {"mu": 0.0, "sigma": 2.0})}
-
-
-def test_prepare_fit_refuses_what_cannot_be_fitted():
-    df = b.demo_table()
-    with pytest.raises(ValueError, match="Orient the dashed edges"):
-        b.prepare_fit(df, DEMO_NODES, [b.Edge("price", "demand", False)], "demand")
-    with pytest.raises(ValueError, match="once group means are removed"):
-        b.prepare_fit(df, DEMO_NODES, DEMO_EDGES, "revenue", {"demand": "bernoulli"}, grouped=True)
-    with pytest.raises(ValueError, match="must be a number"):
-        b.prepare_fit(df, DEMO_NODES, DEMO_EDGES, "revenue", priors={"demand": {"beta.mu": "x"}})
+def main_block(script: str) -> str:
+    return script[script.index('if __name__ == "__main__":'):]
 
 
 # --------------------------------------------------------------------------
-# The script's text
+# What the script is
 # --------------------------------------------------------------------------
 
 
-def test_script_is_valid_python_that_defines_everything_it_uses():
-    script = demo_script()
+@pytest.mark.parametrize("snapshot", [demo_snapshot(), file_snapshot(), panel_snapshot()],
+                         ids=["demo", "file", "grouped file"])
+def test_script_is_valid_python_that_defines_everything_it_uses(snapshot):
+    script = export.build_script(snapshot)
     ast.parse(script)
     assert undefined_names(script) == set()
-    assert "@@" not in script
+    assert not re.search(r"^\s*(from|import)\s+dag_studio", script, re.MULTILINE)  # standalone
 
 
-def test_script_is_standalone():
-    script = demo_script()
-    assert not re.search(r"^\s*(from|import)\s+dag_studio", script, re.MULTILINE)
-    assert "from pathmc import BuildModelFromDAG" in script
-
-
-def test_script_names_its_packages_and_the_dag_as_a_digraph():
-    script = demo_script()
-    pins = re.search(r"pip install (.+)", script).group(1).split()
-    assert any(p.startswith("pathmc==") for p in pins) and any(p.startswith("pymc==") for p in pins)
+def test_script_loads_the_dag_as_a_digraph_and_names_its_packages():
+    script = export.build_script(file_snapshot())
     assert 'DAG = """digraph {\n  "demand" -> "revenue";' in script
-    assert '  "season" -> "promo";\n}"""' in script  # sorted, one edge per line
+    assert '  "season" -> "promo";\n}"""' in script  # one edge per line, sorted
+    pins = re.search(r"pip install (.+)", script).group(1).split()
+    assert {"pathmc", "pymc", "nutpie", "polars", "networkx"} <= {p.split("==")[0] for p in pins}
+    assert all("==" in p for p in pins)  # versions are pinned
 
 
-def test_script_shows_the_fit_call_and_the_settings():
-    script = demo_script()
-    assert "DRAWS, TUNE, CHAINS, SEED = 500, 500, 4, 0" in script
-    assert 'OUTCOME = "revenue"' in script and "ALPHA = 0.05" in script
-    assert 'PRIORS = {\n    "beta_revenue": Prior("Normal", mu=0, sigma=5),\n}' in script
-    assert "FAMILIES = {}" in script
-    call = script[script.index("builder = BuildModelFromDAG("):]
-    call = call[: call.index(")\n") + 2]
-    for part in ("dag=graph", "target=OUTCOME", 'style="native"', "families=FAMILIES or None",
-                 "priors=PRIORS or None"):
-        assert part in call
-    assert "model.fit(draws=DRAWS, tune=TUNE, chains=CHAINS, progressbar=False, random_seed=SEED)" in script
+def test_script_fits_the_model_inside_main_and_keeps_it_in_variables():
+    main = main_block(export.build_script(file_snapshot()))
+    for line in ("builder = BuildModelFromDAG(", "dag=graph,", "target=OUTCOME,",
+                 'style="native",', "families=FAMILIES or None,", "priors=PRIORS or None,",
+                 "model = builder.to_pathmodel()",
+                 "idata = model.fit(draws=DRAWS, tune=TUNE, chains=CHAINS, progressbar=False, "
+                 "random_seed=SEED)"):
+        assert line in main
+    assert "graph = load_dag(DAG)" in main
 
 
-def test_script_data_section_depends_on_where_the_data_came_from():
-    demo = demo_script()
-    assert "def demo_table" in demo and "DATA_FILE" not in demo
-    assert "the built-in demo data" in demo
-    file_script = demo_script(data_kind="file", data_file="sales 2026.csv")
-    assert 'DATA_FILE = "sales 2026.csv"' in file_script and "def demo_table" not in file_script
-    assert "sales 2026.csv (put it in the same folder as this script)" in file_script
-    assert undefined_names(file_script) == set()
+def test_script_makes_the_user_provide_the_data_path_in_main():
+    script = export.build_script(file_snapshot(file="sales 2026.csv"))
+    main = main_block(script)
+    assert 'data_path = "path/to/sales 2026.csv"' in main  # a placeholder, not a real path
+    assert "raise SystemExit" in main and "Set data_path in the __main__ section" in main
+    assert "data_path" not in script.split('if __name__ == "__main__":')[0].split('"""')[2]  # not a global
+    # The data is loaded with polars, and prepared as the app prepared it.
+    assert "raw = pl.read_csv(data_path, infer_schema_length=10_000)" in main
+    assert "table, _, extras = clean_table_with_extras(raw)" in main
+    assert "pandas" not in "".join(main.split("to_pandas")[0:1])  # pandas is only for pathmc's input
+    parquet = main_block(export.build_script(file_snapshot(file="sales.parquet")))
+    assert "raw = pl.read_parquet(data_path)" in parquet
 
 
-def test_script_survives_awkward_file_names_and_grouping_settings():
-    script = demo_script(
-        data_kind="file", data_file='my "odd" file.csv', group_cols=["region", "store"],
-        time_col="week", nodes=[f"variable_{i}" for i in range(12)],
+def test_script_for_the_demo_data_needs_no_path():
+    script = export.build_script(demo_snapshot())
+    main = main_block(script)
+    assert "data_path" not in main and "table = demo_table()" in main
+    assert "def demo_table" in script and "clean_table_with_extras" not in script
+
+
+def test_script_carries_only_what_this_fit_needs():
+    plain = export.build_script(file_snapshot())
+    assert "apply_grouping" not in plain and "dataclass" not in plain
+    assert "GROUP_COLUMNS" not in plain and "TIME_COLUMN" not in plain
+    assert len(plain.splitlines()) < 150  # was ~1000 lines when it also printed a report
+    assert "Prior(" in plain and "from pymc_extras.prior import Prior" in plain
+    no_priors = export.build_script(file_snapshot(specs={}))
+    assert "PRIORS = {}" in no_priors and "pymc_extras" not in no_priors
+    assert "FAMILIES = {}" in no_priors
+
+    timed = export.build_script(file_snapshot(time_column="week"))
+    assert 'TIME_COLUMN = "week"' in timed
+    assert "data = table.drop(TIME_COLUMN, strict=False)" in main_block(timed)
+
+    grouped = export.build_script(panel_snapshot())
+    assert 'GROUP_COLUMNS = ["region", "store"]' in grouped and 'TIME_COLUMN = "week"' in grouped
+    assert "data = apply_grouping(frame, GROUP_COLUMNS, TIME_COLUMN, list(table.columns)).df" in grouped
+    assert "SHORT_GROUP_ROWS = 5" in grouped
+
+
+def test_script_writes_settings_that_round_trip():
+    script = export.build_script(
+        file_snapshot(file='my "odd" file.csv', families={"demand": "studentt"},
+                      group_columns=["a b", "c"], time_column="t",
+                      specs={"beta_demand": ["Normal", {"mu": 0.0, "sigma": 2.5}]})
     )
-    tree = ast.parse(script)
-    assigned = {t.id: n.value for n in tree.body if isinstance(n, ast.Assign)
+    assigned = {t.id: n.value for n in ast.parse(script).body if isinstance(n, ast.Assign)
                 for t in n.targets if isinstance(t, ast.Name)}
-    assert ast.literal_eval(assigned["DATA_FILE"]) == 'my "odd" file.csv'
-    assert ast.literal_eval(assigned["GROUP_COLUMNS"]) == ["region", "store"]
-    assert ast.literal_eval(assigned["TIME_COLUMN"]) == "week"
-    assert ast.literal_eval(assigned["NODES"]) == [f"variable_{i}" for i in range(12)]
+    assert ast.literal_eval(assigned["GROUP_COLUMNS"]) == ["a b", "c"]
+    assert ast.literal_eval(assigned["FAMILIES"]) == {"demand": "studentt"}
+    assert ast.literal_eval(assigned["TIME_COLUMN"]) == "t"
+    assert 'Prior("Normal", mu=0, sigma=2.5)' in script
+    assert '"path/to/my \\"odd\\" file.csv"' in script  # an awkward name stays valid Python
 
 
 # --------------------------------------------------------------------------
-# The export button, through the state
+# Which DAG is exported
 # --------------------------------------------------------------------------
 
 
@@ -170,180 +179,146 @@ def demo_state() -> State:
     return st
 
 
-def test_export_code_in_the_state_uses_the_apps_current_settings():
+def test_export_needs_a_fit_first():
     st = demo_state()
-    st.families = {"demand": "studentt"}
-    st.prior_text = {"revenue": {"beta.sigma": "3"}}
-    st.alpha = "0.01"
+    assert st.can_export_code is False
+    State.export_code.fn(st)
+    assert st.error.startswith("Could not export the code: Fit the model first")
+
+
+def test_export_is_the_dag_that_was_fitted_not_the_edits_since():
+    st = demo_state()
+    st.fit_snapshot = demo_snapshot()
+    st.fitted, st.stale = True, False
+    # The user then edits the graph: an edge removed, another added.
+    st.edges = [e for e in st.edges if (e["source"], e["target"]) != ("season", "promo")]
+    st.edges.append({"source": "noise", "target": "price", "directed": True})
+    st.stale = True
     script = st._export_script()
-    assert 'FAMILIES = {"demand": "studentt"}' in script and "ALPHA = 0.01" in script
-    assert 'Prior("Normal", mu=0, sigma=3)' in script and 'OUTCOME = "revenue"' in script
-    assert "demo data" in script
+    assert '"season" -> "promo";' in script  # still the fitted graph
+    assert "noise" not in script.split("# What DAG Studio fitted it with.")[0].split("DAG = ")[1]
+    assert st.can_export_code is True
     assert State.export_code.fn(st) is not None and st.error == ""
 
 
-def test_export_code_says_what_to_fix_instead_of_exporting_a_graph_that_cannot_be_fitted():
-    st = demo_state()
-    st.edges = st.edges + [{"source": "noise", "target": "price", "directed": False}]
-    State.export_code.fn(st)
-    assert st.error.startswith("Could not export the code: ") and "dashed" in st.error
-    assert st.can_export_code is False
+def test_the_fitted_dag_is_forgotten_when_the_data_or_graph_it_came_from_is_replaced():
+    for forget in (
+        lambda st: st._discard_results(),  # an import or a change of grouping
+        lambda st: st._reset_graph(),  # new data
+    ):
+        st = demo_state()
+        st.fit_snapshot = demo_snapshot()
+        forget(st)
+        assert st.fit_snapshot == {} and st.can_export_code is False
 
-    st = demo_state()
-    st.prior_text = {"revenue": {"beta.mu": "abc"}}
-    State.export_code.fn(st)
-    assert "must be a number" in st.error
-
-
-def test_export_code_remembers_the_file_and_the_grouping():
     st = State(_reflex_internal_init=True)
     df, notes, extras = b.load_dataset(b.PANEL_TEST_FILE)
-    st._set_table(df, notes, "dag_studio_panel_data.csv", target="revenue", extras=extras)
+    st._set_table(df, notes, "panel.csv", target="revenue", extras=extras)
+    st.fit_snapshot = panel_snapshot()
     State.add_group_col.fn(st, "region")
-    State.add_group_col.fn(st, "store")
-    State.set_time_col.fn(st, "week")
-    st.edges = [{"source": s, "target": t, "directed": True} for s, t in
-                [("price", "demand"), ("promo", "demand"), ("demand", "revenue")]]
-    script = st._export_script()
-    assert 'DATA_FILE = "dag_studio_panel_data.csv"' in script
-    assert 'GROUP_COLUMNS = ["region", "store"]' in script and 'TIME_COLUMN = "week"' in script
-    assert "footfall" in script  # an unconnected variable is still in NODES, for Validate DAG
-    # Grouped data cannot take a non-Gaussian family, and the export says so too.
-    st.families = {"demand": "bernoulli"}
-    State.export_code.fn(st)
-    assert "once group means are removed" in st.error
+    assert st.fit_snapshot == {}  # the fit was on different data
+
+
+def test_state_records_what_a_fit_used(tmp_path):
+    """Run the app's real fit handler and check it remembers the fitted graph and settings."""
+    st = demo_state()
+    st.families = {"demand": "studentt"}
+    st.prior_text = {"revenue": {"beta.sigma": "5"}}
+
+    class Proxy:  # stands in for the StateProxy that a background handler runs on
+        def __init__(self, state):
+            object.__setattr__(self, "_state", state)
+
+        def __getattr__(self, name):
+            return getattr(self._state, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._state, name, value)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    asyncio.run(State.fit.fn(Proxy(st)))
+    assert st.fitted and st.error == ""
+    snap = st.fit_snapshot
+    assert snap["outcome"] == "revenue" and snap["data_kind"] == "demo"
+    assert snap["pairs"] == sorted([e.source, e.target] for e in DEMO_EDGES)
+    assert snap["families"] == {"demand": "studentt"}
+    assert snap["specs"] == {"beta_revenue": ["Normal", {"mu": 0.0, "sigma": 5.0}]}
+    assert (snap["draws"], snap["chains"], snap["seed"]) == (b.DRAWS, b.CHAINS, b.RANDOM_SEED)
+    assert st.can_export_code is True
 
 
 # --------------------------------------------------------------------------
-# Running the script: it must reproduce the app
+# Running the script: it must refit the app's model
 # --------------------------------------------------------------------------
 
 
-def run_script(script: str, workdir, *files) -> tuple[str, dict]:
-    for source in files:
-        shutil.copy(source, workdir)
-    (workdir / "dag_studio_analysis.py").write_text(script)
-    done = subprocess.run(
-        [sys.executable, "dag_studio_analysis.py"], cwd=workdir, capture_output=True,
-        text=True, timeout=900,
-    )
-    assert done.returncode == 0, done.stderr[-3000:]
-    return done.stdout, json.loads((workdir / "dag_studio_output" / "results.json").read_text())
+def run_script(script: str, tmp_path: Path) -> dict:
+    """Run the script's __main__ section in this process and return what it defined."""
+    import runpy
+
+    path = tmp_path / "dag_studio_model.py"
+    path.write_text(script)
+    return runpy.run_path(str(path), run_name="__main__")
 
 
-def close(a: float, b_: float, tol: float = 1e-6) -> None:
-    assert a == pytest.approx(b_, rel=tol, abs=tol)
+def parameters(model) -> pd.DataFrame:
+    summary = model.summary()
+    return summary[~summary.index.str.startswith(("mu_", "pathmc_resp_"))]
 
 
-def assert_matches_the_app(results: dict, fit: b.FitResult, data: pl.DataFrame) -> None:
-    equations = b.model_equations(fit.model, fit.families)
-    quality = b.fit_quality(fit)
-    assert set(results["equations"]) == set(equations)
-    for node, eq in equations.items():
-        got = results["equations"][node]
-        for field in ("mean", "lower", "upper"):
-            close(got["intercept"][field], getattr(eq.intercept, field))
-            if eq.sigma is not None:
-                close(got["sigma"][field], getattr(eq.sigma, field))
-        assert [t["name"] for t in got["terms"]] == [t.name for t in eq.terms]
-        for theirs, ours in zip(got["terms"], eq.terms):
-            for field in ("mean", "lower", "upper"):
-                close(theirs[field], getattr(ours, field))
-    for n in quality.nodes:
-        for field in ("r2", "lower", "upper"):
-            close(results["r2"][n.node][field], getattr(n, field))
-    close(results["diagnostics"]["max_rhat"], quality.max_rhat)
-    assert results["diagnostics"]["divergences"] == quality.divergences
+def assert_same_model(script_model, app_model) -> None:
+    pd.testing.assert_frame_equal(parameters(script_model), parameters(app_model), rtol=1e-9)
 
 
 @pytest.mark.slow
-def test_script_reproduces_the_app_on_ungrouped_data(tmp_path):
-    df = b.demo_table()
-    priors = {"revenue": {"beta.sigma": "5"}}
-    fit = b.fit_model(df, DEMO_NODES, DEMO_EDGES, "revenue", priors=priors)  # what the app does
-    stdout, results = run_script(demo_script(), tmp_path)
-    assert_matches_the_app(results, fit, df)
-
-    # The printed report has the app's sections, in order.
-    sections = re.findall(r"^== (.+?) ==$", stdout, re.MULTILINE)
-    assert sections == ["Data", "Validate DAG", "Fit quality", "Fitted equations",
-                        "Direct effects (the colours the app draws on the edges)",
-                        "Effect curves, E[child | do(parent)]"]
-    assert "demo data · 800 rows · 6 variables" in stdout
-    assert b.CONVERGED_NOTE in stdout or "Borderline" in stdout
-    assert re.search(r"4 chains × 500 draws · largest r̂ \d\.\d{3} · smallest ESS \d+ · 0 divergences", stdout)
-    assert "demand → revenue: direct coefficient" in stdout and "raises its child" in stdout
-
-    # The validation result is the app's.
-    check = b.validate_graph(df, DEMO_NODES, DEMO_EDGES, 0.05)
-    assert results["validation"]["n_tests"] == check.n_tests
-    assert [(v["x"], v["y"]) for v in results["validation"]["violations"]] == [
-        (v.x, v.y) for v in check.violations
-    ]
-
-    # The effect curves are the app's: one per edge, plus each node's effect on the outcome.
-    with open(tmp_path / "dag_studio_output" / "effect_curves.csv") as handle:
-        rows = list(csv.DictReader(handle))
-    pairs = {(r["source"], r["target"]) for r in rows}
-    assert {(e.source, e.target) for e in DEMO_EDGES} <= pairs
-    assert ("season", "revenue") in pairs  # no edge, but a path: the node-effect curve
-    curve = b.edge_curve(fit.model, df, "season", "revenue")
-    mine = [r for r in rows if (r["source"], r["target"]) == ("season", "revenue")]
-    assert len(mine) == len(curve.x)
-    for row, x, m, lo, hi in zip(mine, curve.x, curve.mean, curve.lower, curve.upper):
-        close(float(row["x"]), x)
-        close(float(row["mean"]), m, 1e-5)
-        close(float(row["lower"]), lo, 1e-5)
-        close(float(row["upper"]), hi, 1e-5)
-    assert len(list((tmp_path / "dag_studio_output").glob("effect_*.html"))) == len(pairs)
+def test_script_refits_the_app_model_exactly_on_the_demo_data(tmp_path):
+    fit = b.fit_model(b.demo_table(), DEMO_NODES, DEMO_EDGES, "revenue",
+                      priors={"revenue": {"beta.sigma": "5"}})
+    namespace = run_script(export.build_script(demo_snapshot()), tmp_path)
+    assert {"builder", "model", "idata"} <= set(namespace)
+    assert_same_model(namespace["model"], fit.model)
 
 
 @pytest.mark.slow
-def test_script_reproduces_the_app_on_grouped_data(tmp_path):
-    df, notes, extras = b.load_dataset(b.PANEL_TEST_FILE)
-    grouped = b.apply_grouping(df.hstack(extras), ["region", "store"], "week", list(df.columns))
-    nodes = grouped.df.columns
-    edges = [b.Edge("price", "demand"), b.Edge("promo", "demand"), b.Edge("demand", "revenue"),
-             b.Edge("price", "revenue")]
-    fit = b.fit_model(grouped.df, nodes, edges, "revenue", grouped=True)
-    plan = b.prepare_fit(grouped.df, nodes, edges, "revenue", grouped=True)
-    script = export.build_script(
-        nodes=nodes, outcome="revenue", plan=plan, data_kind="file",
-        data_file=b.PANEL_TEST_FILE.name, group_cols=["region", "store"], time_col="week",
-        alpha=0.05,
-    )
-    stdout, results = run_script(script, tmp_path, b.PANEL_TEST_FILE)
-    assert_matches_the_app(results, fit, grouped.df)
-    assert "dag_studio_panel_data.csv · 240 rows · 5 variables (group means removed)" in stdout
-    assert "12 groups (region × store), 20 rows each, balanced, 20 periods" in stdout
-    assert "within groups, after group means are removed" in stdout
-    assert "Group means were removed first" in stdout
-    close(results["equations"]["demand"]["terms"][0]["mean"], -0.67, 0.1)  # the within-group effect
+def test_script_refits_the_app_model_exactly_on_grouped_panel_data(tmp_path):
+    fit = b.fit_model(panel_data(), panel_data().columns, PANEL_EDGES, "revenue", grouped=True)
+    script = export.build_script(panel_snapshot(), data_path=str(b.PANEL_TEST_FILE))
+    assert_same_model(run_script(script, tmp_path)["model"], fit.model)
 
 
 @pytest.mark.slow
-def test_script_reproduces_a_non_gaussian_fit_with_custom_priors(tmp_path):
-    import numpy as np
+def test_script_refits_messy_data_with_a_non_gaussian_family_and_priors(tmp_path):
+    df, _ = b.load_table(b.TEST_FILE)  # renamed, text, constant and incomplete columns
+    nodes = df.columns
+    edges = [b.Edge("ad_spend", "web_visits"), b.Edge("web_visits", "orders"),
+             b.Edge("v_2024_price_index", "orders"), b.Edge("orders", "revenue"),
+             b.Edge("orders", "customer_satisfaction_score"),
+             b.Edge("customer_satisfaction_score", "repeat_purchase")]
+    families, priors = {"repeat_purchase": "bernoulli"}, {"revenue": {"beta.sigma": "3"}}
+    fit = b.fit_model(df, nodes, edges, "revenue", families, priors)
+    plan = b.prepare_fit(df, nodes, edges, "revenue", families, priors)
+    snapshot = b.fit_snapshot(plan, "revenue", [], "", "file", b.TEST_FILE.name)
+    script = export.build_script(snapshot, data_path=str(b.TEST_FILE))
+    assert_same_model(run_script(script, tmp_path)["model"], fit.model)
 
-    rng = np.random.default_rng(0)
-    n = 500
-    x = rng.normal(size=n)
-    m = 0.8 * x + rng.normal(size=n)
-    y = (rng.random(n) < 1 / (1 + np.exp(-(0.5 * m + 0.7 * x)))).astype(float)
-    pl.DataFrame({"x": x, "m": m, "y": y}).write_csv(tmp_path / "outcomes.csv")
-    df, _ = b.load_table(tmp_path / "outcomes.csv")
-    edges = [b.Edge("x", "m"), b.Edge("m", "y"), b.Edge("x", "y")]
-    families, priors = {"y": "bernoulli"}, {"y": {"beta.sigma": "2"}}
 
-    fit = b.fit_model(df, ["x", "m", "y"], edges, "y", families, priors)
-    plan = b.prepare_fit(df, ["x", "m", "y"], edges, "y", families, priors)
-    script = export.build_script(
-        nodes=["x", "m", "y"], outcome="y", plan=plan, data_kind="file", data_file="outcomes.csv",
-        group_cols=[], time_col="", alpha=0.05,
-    )
-    assert 'FAMILIES = {"y": "bernoulli"}' in script
-    stdout, results = run_script(script, tmp_path)
-    assert_matches_the_app(results, fit, df)
-    assert "logit P(y = 1)" in stdout  # the bernoulli equation, worded as in the app
-    assert results["equations"]["y"]["family"] == "bernoulli"
-    assert results["r2"]["y"]["family"] == "bernoulli"
+@pytest.mark.slow
+def test_script_runs_as_a_program_and_refuses_to_run_without_a_path(tmp_path):
+    script = tmp_path / "dag_studio_model.py"
+    script.write_text(export.build_script(demo_snapshot()))
+    done = subprocess.run([sys.executable, script.name], cwd=tmp_path, capture_output=True,
+                          text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert "beta_revenue[demand]" in done.stdout and "sigma_revenue" in done.stdout
+    assert "mu_revenue" not in done.stdout  # the per-row means are left out
+
+    script.write_text(export.build_script(file_snapshot(file="missing.csv")))
+    done = subprocess.run([sys.executable, script.name], cwd=tmp_path, capture_output=True,
+                          text=True, timeout=600)
+    assert done.returncode != 0
+    assert "Set data_path in the __main__ section" in done.stderr

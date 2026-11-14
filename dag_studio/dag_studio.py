@@ -417,8 +417,18 @@ def fit_step() -> rx.Component:
             spacing="3",
         ),
         hint(
-            "Export code downloads a Python script that loads the DAG as a digraph, fits it "
-            "with the same settings and seed, and prints and saves what you see here."
+            "Export code downloads a Python script for the DAG the model was last fitted on: "
+            "it loads your data from a path you set, loads the DAG as a digraph, and fits "
+            "it with the same settings and seed."
+        ),
+        rx.cond(
+            State.can_export_code & State.stale,
+            hint("The graph changed since the last fit. Export code uses the graph that was "
+                 "fitted, not these edits.", color=AMBER),
+        ),
+        rx.cond(
+            ~State.can_export_code,
+            hint("Fit the model first, to have a fitted DAG to export."),
         ),
     )
 
