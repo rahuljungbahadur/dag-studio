@@ -668,3 +668,179 @@ def test_import_refuses_bad_input_with_a_reason(text, message):
 def test_import_refuses_oversized_text():
     with pytest.raises(ValueError, match="too large"):
         imported("a->b," * b.MAX_IMPORT_CHARS)
+
+
+def test_clean_table_keeps_text_columns_in_step_with_the_rows_that_survive():
+    raw = pl.DataFrame(
+        {
+            "region": ["n", "n", "s", "s", "e"] * 6,
+            "a": [float(i) for i in range(30)],
+            "b": [None if i == 3 else float(i * i % 11) for i in range(30)],
+        }
+    )
+    df, notes, extras = b.clean_table_with_extras(raw)
+    assert df.height == extras.height == 29  # the row with a gap is gone from both
+    assert extras.columns == ["region"]
+    assert extras["region"].to_list() == [r for i, r in enumerate(raw["region"]) if i != 3]
+    # A file with no text columns has nothing extra, and is still fine.
+    only_numbers, _, none_extra = b.clean_table_with_extras(raw.drop("region"))
+    assert none_extra.width == 0 and only_numbers.height == 29
+
+
+def test_panel_test_file_is_current():
+    on_disk = pl.read_csv(b.PANEL_TEST_FILE, infer_schema_length=10_000)
+    assert on_disk.equals(b.panel_test_table()), (
+        "Regenerate with: b.panel_test_table().write_csv(b.PANEL_TEST_FILE)"
+    )
+
+
+def panel_frame():
+    df, _, extras = b.load_dataset(b.PANEL_TEST_FILE)
+    return df, df.hstack(extras)
+
+
+def test_apply_grouping_removes_each_groups_mean_and_says_what_it_found():
+    df, frame = panel_frame()
+    out = b.apply_grouping(frame, ["region", "store"], "week", list(df.columns))
+    assert out.df.columns == ["price", "promo", "demand", "revenue", "footfall"]
+    assert out.df.height == 240
+    assert out.summary.headline == "12 groups (region × store), 20 rows each, balanced, 20 periods"
+    # Within every group, each variable now averages to zero.
+    means = frame.select(["region", "store"]).hstack(out.df).group_by(["region", "store"]).mean()
+    assert all(abs(means[c]).max() < 1e-9 for c in out.df.columns)
+    # Same slopes as a regression with a dummy per group (Frisch-Waugh).
+    keys = (frame["region"] + "|" + frame["store"]).to_numpy()
+    d = np.column_stack([(keys == k).astype(float) for k in np.unique(keys)])
+    X = np.column_stack([frame["price"].to_numpy(), frame["promo"].to_numpy(), d])
+    full = np.linalg.lstsq(X, frame["demand"].to_numpy(), rcond=None)[0][:2]
+    Z = np.column_stack([out.df["price"].to_numpy(), out.df["promo"].to_numpy()])
+    within = np.linalg.lstsq(Z, out.df["demand"].to_numpy(), rcond=None)[0]
+    assert within == pytest.approx(full, abs=1e-9)
+    assert full[0] == pytest.approx(-0.8, abs=0.15)  # and it recovers the true effect
+
+
+def test_group_level_variables_are_removed_and_named():
+    df, frame = panel_frame()
+    out = b.apply_grouping(frame, ["region", "store"], "week", list(df.columns))
+    warning = next(w for w in out.summary.warnings if "never vary within a group" in w)
+    assert "store_size" in warning and "region_income" in warning and "week" not in warning
+    # Grouping by region alone leaves store_size, which varies across the stores of a region.
+    by_region = b.apply_grouping(frame, ["region"], "week", list(df.columns))
+    assert "store_size" in by_region.df.columns and "region_income" not in by_region.df.columns
+
+
+def test_a_store_name_repeated_across_regions_is_flagged_and_the_composite_is_not():
+    df, frame = panel_frame()
+    alone = b.apply_grouping(frame, ["store"], "week", list(df.columns))
+    assert alone.summary.n_groups == 4
+    assert any("repeat a (group, week) pair" in w for w in alone.summary.warnings)
+    composite = b.apply_grouping(frame, ["region", "store"], "week", list(df.columns))
+    assert composite.summary.n_groups == 12
+    assert not any("repeat" in w for w in composite.summary.warnings)
+
+
+def test_grouping_drops_unusable_rows_and_reports_them():
+    rng = np.random.default_rng(0)
+    n = 62
+    frame = pl.DataFrame(
+        {
+            "g": ["a"] * 30 + ["b"] * 30 + [None, "lonely"],
+            "x": rng.normal(size=n),
+            "y": rng.normal(size=n),
+        }
+    )
+    out = b.apply_grouping(frame, ["g"], "", ["x", "y"])
+    assert out.df.height == 60 and out.summary.n_groups == 2
+    assert "1 row(s) with a missing group value were dropped." in out.summary.warnings
+    assert any("1 group(s) with a single row were dropped" in w for w in out.summary.warnings)
+    assert out.summary.headline == "2 groups (g), 30 rows each, balanced"
+
+
+def test_short_groups_get_an_honest_warning():
+    rng = np.random.default_rng(1)
+    frame = pl.DataFrame(
+        {"g": np.repeat(np.arange(15), 4), "x": rng.normal(size=60), "y": rng.normal(size=60)}
+    )
+    out = b.apply_grouping(frame, ["g"], "", ["x", "y"])
+    assert any("few rows (median 4)" in w and "too narrow" in w for w in out.summary.warnings)
+
+
+@pytest.mark.parametrize(
+    "keys,time,message",
+    [
+        ([], "", "at least one group column"),
+        (["region", "region"], "", "only be used once"),
+        (["region"], "region", "cannot also be a group column"),
+        (["nope"], "", "Not columns of the data: nope"),
+    ],
+)
+def test_apply_grouping_refuses_bad_choices(keys, time, message):
+    df, frame = panel_frame()
+    with pytest.raises(ValueError, match=message):
+        b.apply_grouping(frame, keys, time, list(df.columns))
+
+
+def test_a_single_group_is_refused():
+    frame = pl.DataFrame({"g": ["a"] * 30, "x": np.arange(30.0), "y": np.arange(30.0) ** 2})
+    with pytest.raises(ValueError, match="at least two"):
+        b.apply_grouping(frame, ["g"], "", ["x", "y"])
+
+
+def test_grouping_gives_the_right_graph_where_pooling_gets_it_wrong():
+    df, frame = panel_frame()
+    variables = ["price", "promo", "demand", "revenue", "footfall"]
+    grouped = b.apply_grouping(frame, ["region", "store"], "week", list(df.columns)).df
+    pooled_edges, _ = b.discover(df.select(variables), "revenue")
+    grouped_edges, _ = b.discover(grouped, "revenue")
+    truth = {("price", "demand"), ("promo", "demand"), ("demand", "revenue"), ("price", "revenue")}
+    assert {(e.source, e.target) for e in grouped_edges if e.directed} == truth
+    assert not any("footfall" in (e.source, e.target) for e in grouped_edges)
+    # Ignoring the groups invents a link to footfall, and gets the rest wrong.
+    assert any("footfall" in (e.source, e.target) for e in pooled_edges)
+    assert {(e.source, e.target) for e in pooled_edges if e.directed} != truth
+    # The true graph is not contradicted by grouped data, and is by pooled data.
+    true_edges = [b.Edge(*pair) for pair in sorted(truth)]
+    assert b.validate_graph(grouped, variables, true_edges).violations == []
+    assert len(b.validate_graph(df.select(variables), variables, true_edges).violations) >= 2
+
+
+def test_non_gaussian_families_are_ruled_out_on_grouped_data():
+    df = pl.DataFrame({"flag": [0.0, 1.0, 1.0], "n": [1.0, 2.0, 3.0], "z": [0.1, -0.2, 0.3]})
+    assert b.family_problems(df, {"flag": "bernoulli", "n": "poisson"}) == []
+    grouped = b.family_problems(df, {"flag": "bernoulli", "n": "negbinomial", "z": "studentt"}, True)
+    assert len(grouped) == 2 and all("once group means are removed" in p for p in grouped)
+    assert "flag: the bernoulli family" in grouped[0]
+    with pytest.raises(ValueError, match="once group means are removed"):
+        b.fit_model(df, ["flag", "z"], [b.Edge("z", "flag")], "flag", {"flag": "bernoulli"},
+                    grouped=True)
+
+
+def test_figure_axes_say_when_values_are_deviations_from_group_means():
+    curve = b.Curve("price", "demand", [0.0, 1.0], [0.0, 1.0], [-0.1, 0.9], [0.1, 1.1])
+    df = pl.DataFrame({"price": [0.0, 1.0], "demand": [0.0, 1.0]})
+    plain, grouped = b.make_figure(curve, df), b.make_figure(curve, df, grouped=True)
+    assert plain.layout.xaxis.title.text == "price"
+    assert grouped.layout.xaxis.title.text == "price − group mean"
+    assert grouped.layout.yaxis.title.text == "demand − group mean"
+
+
+@pytest.mark.slow
+def test_grouped_fit_recovers_the_effect_that_a_pooled_fit_misses(monkeypatch):
+    monkeypatch.setattr(b, "DRAWS", 300)
+    monkeypatch.setattr(b, "TUNE", 300)
+    df, frame = panel_frame()
+    variables = ["price", "promo", "demand"]
+    edges = [b.Edge("price", "demand"), b.Edge("promo", "demand")]
+    grouped = b.apply_grouping(frame, ["region", "store"], "week", list(df.columns)).df
+
+    def price_slope(data, flag):
+        fit = b.fit_model(data, variables, edges, "demand", grouped=flag)
+        term = next(t for t in b.model_equations(fit.model)["demand"].terms if t.name == "price")
+        return term
+
+    within, pooled = price_slope(grouped, True), price_slope(df.select(variables), False)
+    # The true effect is -0.8. Removing group means gets close (least squares on the same
+    # 240 rows says -0.67); ignoring the groups is far off, towards zero (-0.22).
+    assert abs(within.mean + 0.8) < 0.2
+    assert abs(pooled.mean + 0.8) > 0.4
+    assert within.lower < within.mean < within.upper

@@ -321,3 +321,118 @@ def test_import_file_reads_text_and_rejects_binary():
     asyncio.run(State.import_file.fn(st, [Upload("pic.png", b"\x89PNG\r\n\x1a\n\xff\xfe")]))
     assert st.import_ok is False and "not a text file" in st.import_message
     assert edge_pairs(st) == {("a", "b", True)}
+
+
+def panel_state() -> State:
+    """A State with the panel test file loaded the way the app loads it."""
+    from dag_studio import backend as b
+
+    st = State(_reflex_internal_init=True)
+    df, notes, extras = b.load_dataset(b.PANEL_TEST_FILE)
+    st._set_table(df, notes, "panel", target="revenue", extras=extras)
+    return st
+
+
+def test_loading_keeps_the_text_columns_available_for_grouping():
+    st = panel_state()
+    assert st.grouped is False and st.group_candidates[:2] == ["region", "store"]
+    assert "week" in st.group_candidates and st.time_options[0] == "(none)"
+    assert "week" in st.columns and "region" not in st.columns  # ungrouped: week is a variable
+
+
+def test_choosing_group_columns_swaps_the_data_for_group_demeaned_variables():
+    st = panel_state()
+    State.add_group_col.fn(st, "region")
+    State.add_group_col.fn(st, "store")
+    assert st.group_cols == ["region", "store"] and st.group_path == "region › store"
+    assert st.group_headline.startswith("12 groups (region × store), 20 rows each")
+    assert "region" not in st.group_candidates and "store" not in st.group_candidates
+    State.set_time_col.fn(st, "week")
+    assert st.time_col == "week" and "week" not in st.columns and "week" not in st.nodes
+    assert st.columns == ["price", "promo", "demand", "revenue", "footfall"]
+    assert st.nodes == st.columns and st.n_rows == 240 and st.target == "revenue"
+    # The analysed data is the demeaned table, which the rest of the app reads.
+    df = st._session()["df"]
+    assert df.columns == st.columns and abs(df["price"].mean()) < 1e-9
+    assert st._session()["raw"].columns != df.columns  # the original is kept for undoing it
+    # Group-level variables were removed and named in the warnings.
+    assert any("store_size" in w for w in st.group_warnings)
+
+
+def test_changing_the_grouping_discards_what_the_old_data_produced():
+    st = panel_state()
+    st.edges = [
+        {"source": "price", "target": "demand", "directed": True},
+        {"source": "week", "target": "demand", "directed": True},
+    ]
+    st.flagged_edges, st.fitted, st.validated_sig = ["week~demand"], True, "old"
+    st.families = {"demand": "studentt"}
+    st._session()["model"], st._session()["evidence"] = object(), {"price~demand": object()}
+    State.add_group_col.fn(st, "region")
+    State.add_group_col.fn(st, "store")
+    assert len(st.edges) == 2  # week is still a variable until it is made the time column
+    State.set_time_col.fn(st, "week")
+    assert [(e["source"], e["target"]) for e in st.edges] == [("price", "demand")]  # week is gone
+    assert st.flagged_edges == [] and st.families == {"demand": "studentt"}
+    assert st.fitted is False and st.has_validation is False
+    assert "model" not in st._session() and st._session()["evidence"] == {}
+
+
+def test_a_grouping_that_cannot_work_changes_nothing_and_says_why():
+    st = panel_state()
+    State.add_group_col.fn(st, "region")
+    before = (list(st.group_cols), list(st.columns), st.n_rows, st.group_headline)
+    State.add_group_col.fn(st, "price")  # every price is its own group: all singletons
+    assert st.group_error != ""
+    assert (list(st.group_cols), list(st.columns), st.n_rows, st.group_headline) == before
+    State.add_group_col.fn(st, "store")  # a good choice clears the message
+    assert st.group_error == ""
+
+
+def test_removing_and_clearing_groups_restores_the_variables():
+    st = panel_state()
+    for column in ("region", "store"):
+        State.add_group_col.fn(st, column)
+    State.remove_group_col.fn(st, "store")
+    assert st.group_cols == ["region"] and "store_size" in st.columns
+    assert "store_size" in st.nodes  # a variable that reappears becomes a node again
+    State.clear_grouping.fn(st)
+    assert st.grouped is False and st.group_headline == "" and st.group_warnings == []
+    assert st._session()["df"] is st._session()["raw"] and "week" in st.columns
+
+
+def test_grouped_wording_reaches_the_numbers():
+    st = panel_state()
+    st._r2_text, st.fitted, st.stale = {"demand": "0.62 [0.55, 0.69]"}, True, False
+    st.selected_nodes = ["demand"]
+    assert st.picked_r2 == "R² = 0.62 [0.55, 0.69]"
+    State.add_group_col.fn(st, "region")
+    st._r2_text, st.fitted = {"demand": "0.62 [0.55, 0.69]"}, True
+    st.selected_nodes = ["demand"]
+    assert st.picked_r2.endswith("within groups")
+    # A non-Gaussian family on grouped data is refused straight away.
+    st.selected_nodes = ["demand"]
+    State.set_family.fn(st, "bernoulli")
+    assert "once group means are removed" in st.error
+
+
+def test_loading_new_data_clears_the_grouping():
+    st = panel_state()
+    State.add_group_col.fn(st, "region")
+    st.grouping_open = True
+    st._set_table(st._session()["raw"], [], "other")
+    assert st.group_cols == [] and st.time_col == "" and st.grouping_open is False
+    assert st.group_headline == "" and st.group_candidates == st.all_columns
+
+
+def test_importing_a_dag_uses_the_variables_not_the_group_columns():
+    st = panel_state()
+    State.add_group_col.fn(st, "region")
+    State.add_group_col.fn(st, "store")
+    st.paste_text = "demand ~ price + promo\nrevenue ~ demand"
+    State.import_pasted.fn(st)
+    assert st.import_ok and len(st.edges) == 3
+    st.paste_text = "demand ~ week"  # week was the time column, so it is not a variable now
+    State.set_time_col.fn(st, "week")
+    State.import_pasted.fn(st)
+    assert st.import_ok is False and "week" in st.import_message

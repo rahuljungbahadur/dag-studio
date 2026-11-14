@@ -60,6 +60,25 @@ instruction.
 1. **Upload** a CSV or Parquet file. Numeric columns become nodes; non-numeric
    and constant columns are ignored, and rows with missing values are dropped.
    The left panel lists exactly what was changed.
+
+   **Panel data?** Open *Panel data: group the rows* and pick the columns that
+   identify a group, from the broadest to the finest: `region`, then `store`.
+   Text columns and ID columns are both offered; a group is one *combination*,
+   so a store name used in several regions still gives separate groups. An
+   optional time column is kept out of the graph and used to check the panel.
+   Each group's mean is then removed from every variable (the fixed-effects
+   estimate), and discovery, validation, the fit, the plots and R² all use that
+   data, so group differences cannot create false links. On simulated data
+   where the true effect was 0.5, ignoring groups gave 0.9 to 1.0 and removing
+   group means gave 0.5 to 0.6. The panel summarises the result ("12 groups
+   (region × store), 20 rows each, balanced") and warns about: rows with a
+   missing group value (dropped), groups of one row (dropped), a repeated
+   (group, time) pair (usually a label shared by different groups), short
+   groups (intervals come out somewhat too narrow), and variables that never
+   vary within a group, such as a region-level income, which are removed because
+   nothing is left of them once group differences are taken out. Changing the
+   grouping discards the fit, validation and discovery evidence, which used the
+   old data. See the limits below.
 2. **Pick the outcome** and press **Discover DAG**. A progress bar in the top
    right shows how many of TBFPC's passes (one per variable's link to the
    outcome, then one per pair of other variables) are done. Dashed edges are
@@ -181,6 +200,18 @@ drop zone too. Things to check:
   `bernoulli` on a continuous node such as `orders` shows an error straight
   away.
 
+- **Panel data**: press **Load panel test file** (a `region`, `store`, `week`
+  panel: 3 regions x 4 stores x 20 weeks, store names repeating across
+  regions). First **Discover DAG** with no grouping: the graph is wrong (an
+  edge reversed, `footfall` linked to `price`, `price → revenue` missing).
+  Open *Panel data*, add `region` then `store`, and set the time column to
+  `week`. The summary reads "12 groups (region × store), 20 rows each,
+  balanced, 20 periods"; `store_size` and `region_income` are removed with an
+  explanation. Discover again: exactly `price → demand`, `promo → demand`,
+  `demand → revenue`, `price → revenue`, with `footfall` left alone. Try
+  adding only `store` to see the repeated-label warning, and set `demand` to
+  `bernoulli` to see it refused. After a fit the price → demand slope is
+  about -0.67 (true -0.8; ungrouped it is about -0.22).
 - **Import**: with the test file loaded, paste this into the box in step 2 and
   press **Import pasted DAG** (`2024 price index` is matched to
   `v_2024_price_index`):
@@ -220,6 +251,13 @@ uv build                      # sdist and wheel (the wheel holds the dag_studio 
 - **Linear, Gaussian, numeric only.** Both discovery and the fitted model are
   linear. A purely nonlinear dependence can be missed, and the plotted curve
   will always be a straight line.
+- **Grouped data is a fixed-effects analysis only.** Removing group means
+  compares each group with itself, so effects of group-level variables cannot
+  be estimated, and `bernoulli`, `poisson` and `negbinomial` outcomes are
+  refused (a demeaned 0/1 or count is no longer a 0/1 or count). Time effects,
+  random intercepts and slopes, and lags are not done: pathmc supports them
+  (`panel=` and `pooling=` in `pathmc.model`), but `BuildModelFromDAG` does not
+  pass them on. Plots and R² are in deviations from group means, and say so.
 - **Discovery is target-first.** TBFPC searches for drivers of the chosen
   outcome. It is not a symmetric whole-graph search, and pathmc marks it
   experimental.

@@ -69,6 +69,82 @@ def step(n: int, title: str, instruction: str, *body, needs_data: bool = True) -
     )
 
 
+def group_chip(column: str) -> rx.Component:
+    return rx.badge(
+        column, " ×", on_click=State.remove_group_col(column), cursor="pointer",
+        variant="soft", color_scheme="blue", size="1",
+    )
+
+
+def grouping_controls() -> rx.Component:
+    """Say which columns identify a group (a store, a country…), for panel data."""
+    header = rx.hstack(
+        rx.text(rx.cond(State.grouping_open, "▾", "▸"), size="1", color=MUTED, width="10px"),
+        rx.text("Panel data: group the rows", size="1", weight="medium", color=INK),
+        rx.cond(State.grouped, rx.badge("on", color_scheme="blue", variant="soft", size="1")),
+        spacing="2", align="center", cursor="pointer", on_click=State.toggle_grouping,
+    )
+    controls = rx.vstack(
+        hint(
+            "Pick the columns that identify a group, from the broadest to the finest: region, "
+            "then store. A group is one combination, so a store name used in several regions "
+            "still gives separate groups. Each group's mean is then removed from every "
+            "variable, so only differences within a group are compared. This keeps group "
+            "differences from creating false links, and applies to discovery, validation "
+            "and the fit."
+        ),
+        rx.cond(
+            State.grouped,
+            rx.hstack(
+                rx.foreach(State.group_cols, group_chip),
+                wrap="wrap", spacing="1", align="center",
+            ),
+        ),
+        rx.select(
+            State.group_candidates, value=State.group_pick, placeholder="Add a group column…",
+            on_change=State.add_group_col, size="1",
+        ),
+        rx.hstack(
+            rx.text("Time column", size="1", color=MUTED),
+            rx.spacer(),
+            rx.select(State.time_options, value=State.time_value, on_change=State.set_time_col,
+                      size="1"),
+            width="100%", align="center",
+        ),
+        hint("Optional: kept out of the graph, and used to check the panel."),
+        rx.cond(
+            State.group_error != "",
+            rx.text(State.group_error, size="1", color=RED, line_height="1.5"),
+        ),
+        rx.cond(
+            State.grouped,
+            rx.button("Clear grouping", on_click=State.clear_grouping, size="1", variant="ghost",
+                      color_scheme="gray"),
+        ),
+        spacing="2", width="100%", align="stretch", padding_top="4px",
+    )
+    return rx.cond(
+        State.has_data,
+        rx.vstack(
+            header,
+            # Always visible once on: it changes what every later number means.
+            rx.cond(
+                State.grouped,
+                rx.vstack(
+                    rx.text(State.group_headline, size="1", color=INK, line_height="1.5"),
+                    rx.foreach(
+                        State.group_warnings,
+                        lambda w: rx.text(w, size="1", color=AMBER, line_height="1.5"),
+                    ),
+                    spacing="1", width="100%", align="stretch",
+                ),
+            ),
+            rx.cond(State.grouping_open, controls),
+            spacing="2", width="100%", align="stretch", padding_top="6px",
+        ),
+    )
+
+
 def data_step() -> rx.Component:
     return step(
         1, "Load data", "Upload a CSV or Parquet file. Numeric columns become nodes.",
@@ -92,13 +168,15 @@ def data_step() -> rx.Component:
         ),
         rx.cond(
             State.has_data,
-            hint(State.filename, " · ", State.n_rows, " rows · ", State.columns.length(), " variables"),
+            hint(State.filename, " · ", State.n_rows, " rows · ", State.columns.length(),
+                 " variables", rx.cond(State.grouped, " (group means removed)", "")),
             hint(
                 "No file yet? ",
                 rx.link("Load demo data", on_click=State.load_demo, size="1", underline="always"),
             ),
         ),
         rx.foreach(State.notes, lambda note: hint(note)),
+        grouping_controls(),
         hint(
             "Manual testing: ",
             rx.link("Load test file", on_click=State.load_test_file, size="1",
@@ -106,6 +184,14 @@ def data_step() -> rx.Component:
             " · ",
             rx.link("Download test file", size="1", underline="always",
                     on_click=rx.download(url=f"/{b.TEST_FILE.name}")),
+        ),
+        hint(
+            "Panel data: ",
+            rx.link("Load panel test file", on_click=State.load_panel_test_file, size="1",
+                    underline="always"),
+            " · ",
+            rx.link("Download", size="1", underline="always",
+                    on_click=rx.download(url=f"/{b.PANEL_TEST_FILE.name}")),
         ),
         needs_data=False,
     )
@@ -730,8 +816,15 @@ def fit_quality_section() -> rx.Component:
                 hint("The sampler converged: these estimates can be trusted as fits.",
                      color=GREEN),
             ),
-            rx.text("Variance explained by each node's parents (Bayesian R², 89% interval)",
-                    size="1", color=INK, padding_top="4px"),
+            rx.text(
+                rx.cond(
+                    State.grouped,
+                    "Variance explained by each node's parents within groups, after group "
+                    "means are removed (Bayesian R², 89% interval)",
+                    "Variance explained by each node's parents (Bayesian R², 89% interval)",
+                ),
+                size="1", color=INK, padding_top="4px",
+            ),
             rx.foreach(State.r2_rows, r2_row),
             hint(
                 "R² says how well the parents predict a node, not whether the graph is causally "

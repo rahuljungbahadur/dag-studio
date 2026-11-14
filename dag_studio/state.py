@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import plotly.graph_objects as go
+import polars as pl
 import reflex as rx
 
 from . import backend as b
@@ -210,6 +211,16 @@ class State(rx.State):
     progress_pct: int = 0
     progress_known: bool = False  # False: the task cannot say how far along it is
 
+    # --- grouped (panel) data -----------------------------------------
+    all_columns: list[str] = []  # every column a group or time column could be
+    group_cols: list[str] = []  # coarse to fine, e.g. region then store
+    time_col: str = ""
+    group_pick: str = ""  # always empty: the "add a group column" select shows its placeholder
+    group_headline: str = ""
+    group_warnings: list[str] = []
+    group_error: str = ""
+    grouping_open: bool = False
+
     # --- importing a DAG ----------------------------------------------
     paste_text: str = ""
     import_message: str = ""
@@ -404,8 +415,16 @@ class State(rx.State):
         session["evidence"], session["curves"] = {}, {}
         self._refresh(relayout=True)
 
-    def _set_table(self, df, notes: list[str], filename: str, target: str = "") -> None:
-        self._session()["df"] = df
+    def _set_table(
+        self, df, notes: list[str], filename: str, target: str = "", extras=None
+    ) -> None:
+        session = self._session()
+        session["raw"], session["df"] = df, df  # df is replaced by a group-demeaned copy if grouped
+        session["extras"] = extras if extras is not None else pl.DataFrame()
+        self.all_columns = list(session["extras"].columns) + list(df.columns)
+        self.group_cols, self.time_col = [], ""
+        self.group_headline, self.group_warnings, self.group_error = "", [], ""
+        self.grouping_open = False
         self.filename, self.n_rows = filename, df.height
         self.columns, self.notes = df.columns, notes
         self.target = target or df.columns[-1]
@@ -488,6 +507,26 @@ class State(rx.State):
         return self.fitted and not self.stale
 
     @rx.var
+    def grouped(self) -> bool:
+        return len(self.group_cols) > 0
+
+    @rx.var
+    def group_candidates(self) -> list[str]:
+        return [c for c in self.all_columns if c not in self.group_cols and c != self.time_col]
+
+    @rx.var
+    def time_options(self) -> list[str]:
+        return ["(none)"] + [c for c in self.all_columns if c not in self.group_cols]
+
+    @rx.var
+    def time_value(self) -> str:
+        return self.time_col or "(none)"
+
+    @rx.var
+    def group_path(self) -> str:
+        return " › ".join(self.group_cols)
+
+    @rx.var
     def has_validation(self) -> bool:
         return self.validated_sig != ""
 
@@ -561,7 +600,9 @@ class State(rx.State):
     @rx.var
     def picked_r2(self) -> str:
         text = self._r2_text.get(self.picked, "")
-        return f"R² = {text}" if text and self.fitted and not self.stale else ""
+        if not (text and self.fitted and not self.stale):
+            return ""
+        return f"R² = {text}" + (" within groups" if self.grouped else "")
 
     @rx.var
     def picked_description(self) -> str:
@@ -591,11 +632,11 @@ class State(rx.State):
             with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
                 tmp.write(await upload.read())
                 tmp.flush()
-                df, notes = b.load_table(tmp.name)
+                df, notes, extras = b.load_dataset(tmp.name)
         except Exception as exc:  # noqa: BLE001 - show any parse problem to the user
             self.error = f"Could not read {name}: {exc}"
             return
-        self._set_table(df, notes, Path(name).name)
+        self._set_table(df, notes, Path(name).name, extras=extras)
 
     # ------------------------------------------------------------------
     # Importing a DAG
@@ -618,7 +659,12 @@ class State(rx.State):
         self.flagged_nodes = list(
             dict.fromkeys(self.flagged_nodes + [n for n in result.flagged_nodes if n in self.nodes])
         )
-        # The graph is new: nothing fitted or validated before describes it.
+        self._discard_results()  # the graph is new: nothing fitted or validated describes it
+        self._refresh(relayout=True)
+
+    def _discard_results(self) -> None:
+        """Forget the fit, curves and validation: they described a different graph or data."""
+        session = self._session()
         session.pop("model", None)
         session["curves"] = {}
         self.selected_nodes, self.selected_edge, self.refused_cycle = [], "", []
@@ -627,7 +673,79 @@ class State(rx.State):
         self._violations, self.validated_sig, self.selected_violation = [], "", ""
         self.verdict = self.verdict_detail = self.violation_summary = ""
         self.n_found = 0
+
+    # ------------------------------------------------------------------
+    # Grouped (panel) data
+    # ------------------------------------------------------------------
+
+    def _try_grouping(self, keys: list[str], time_col: str) -> bool:
+        """Group the rows by ``keys`` (coarse to fine). On a problem, change nothing."""
+        session = self._session()
+        raw, extras = session["raw"], session["extras"]
+        self.group_error = ""
+        if keys:
+            frame = raw.hstack(extras) if extras.width else raw
+            try:
+                result = b.apply_grouping(frame, keys, time_col, list(raw.columns))
+            except ValueError as exc:
+                self.group_error = str(exc)
+                return False
+            df, headline, warnings = result.df, result.summary.headline, result.summary.warnings
+        else:
+            df = raw.drop(time_col) if time_col in raw.columns else raw
+            headline, warnings = "", []
+            if df.width < 2:
+                self.group_error = "Fewer than two variables would be left."
+                return False
+        session["df"] = df
+        self.group_cols, self.time_col = list(keys), time_col
+        self.group_headline, self.group_warnings = headline, warnings
+        self.columns, self.n_rows = list(df.columns), df.height
+
+        # Variables that appear or disappear change the graph's nodes; everything the
+        # graph learned from the other data is forgotten.
+        known = set(self.nodes) | set(self.removed)
+        self.nodes = [n for n in self.nodes if n in self.columns] + [
+            c for c in self.columns if c not in known
+        ]
+        self.removed = [n for n in self.removed if n in self.columns]
+        self.edges = [
+            e for e in self.edges if e["source"] in self.nodes and e["target"] in self.nodes
+        ]
+        edge_keys = {b.edge_key(e["source"], e["target"]) for e in self.edges}
+        self.flagged_edges = [k for k in self.flagged_edges if k in edge_keys]
+        self.flagged_nodes = [n for n in self.flagged_nodes if n in self.nodes]
+        self.families = {n: f for n, f in self.families.items() if n in self.nodes}
+        self.prior_text = {n: v for n, v in self.prior_text.items() if n in self.nodes}
+        if self.target not in self.columns:
+            self.target = self.columns[-1]
+        session["evidence"] = {}
+        self._discard_results()
+        self.error = ""
         self._refresh(relayout=True)
+        return True
+
+    @rx.event
+    def toggle_grouping(self):
+        self.grouping_open = not self.grouping_open
+
+    @rx.event
+    def add_group_col(self, column: str):
+        """Add a group column below the ones already chosen (they run coarse to fine)."""
+        if column and column not in self.group_cols and column != self.time_col:
+            self._try_grouping(self.group_cols + [column], self.time_col)
+
+    @rx.event
+    def remove_group_col(self, column: str):
+        self._try_grouping([c for c in self.group_cols if c != column], self.time_col)
+
+    @rx.event
+    def set_time_col(self, value: str):
+        self._try_grouping(self.group_cols, "" if value == "(none)" else value)
+
+    @rx.event
+    def clear_grouping(self):
+        self._try_grouping([], "")
 
     def _import_text(self, text: str) -> None:
         self.import_ok, self.import_notes = False, []
@@ -687,11 +805,21 @@ class State(rx.State):
     def load_test_file(self):
         """Load the bundled messy CSV through the same cleaning as an upload."""
         try:
-            df, notes = b.load_table(b.TEST_FILE)
+            df, notes, extras = b.load_dataset(b.TEST_FILE)
         except Exception as exc:  # noqa: BLE001
             self.error = f"Could not read the test file: {exc}"
             return
-        self._set_table(df, notes, b.TEST_FILE.name, target="revenue")
+        self._set_table(df, notes, b.TEST_FILE.name, target="revenue", extras=extras)
+
+    @rx.event
+    def load_panel_test_file(self):
+        """Load the bundled panel CSV (region, store and week columns) for trying grouping."""
+        try:
+            df, notes, extras = b.load_dataset(b.PANEL_TEST_FILE)
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"Could not read the panel test file: {exc}"
+            return
+        self._set_table(df, notes, b.PANEL_TEST_FILE.name, target="revenue", extras=extras)
 
     @rx.event
     def set_target(self, value: str):
@@ -867,7 +995,7 @@ class State(rx.State):
 
     def _check_family(self, node: str, family: str) -> None:
         df = self._session().get("df")
-        problems = b.family_problems(df, {node: family}) if df is not None else []
+        problems = b.family_problems(df, {node: family}, self.grouped) if df is not None else []
         self.error = problems[0] if problems else ""
 
     @rx.event
@@ -1030,11 +1158,13 @@ class State(rx.State):
             session, nodes, edges = self._session(), list(self.nodes), self._edge_objects()
             target, families = self.target, dict(self.families)
             priors = {n: dict(v) for n, v in self.prior_text.items()}
+            grouped = self.grouped
         progress = b.Progress()
 
         async def work():
             fit = await asyncio.to_thread(
-                b.fit_model, session["df"], nodes, edges, target, families, priors, progress
+                b.fit_model, session["df"], nodes, edges, target, families, priors, progress,
+                grouped,
             )
             progress.set(b.fit_step(4))
             equations = await asyncio.to_thread(b.model_equations, fit.model, families)
@@ -1120,7 +1250,12 @@ class State(rx.State):
                     if target in self._r2_text:
                         self.equation_caption += (
                             f" Its parents explain R² = {self._r2_text[target]} of "
-                            f"{target}'s variance."
+                            f"{target}'s variance{' within groups' if self.grouped else ''}."
+                        )
+                    if self.grouped:
+                        self.equation_caption += (
+                            " Group means were removed first, so the slopes are within-group "
+                            "effects and the intercept is near 0."
                         )
                     self.has_equation = True
             else:
@@ -1146,7 +1281,7 @@ class State(rx.State):
             self.busy = ""
             if (self.picked, self.selected_edge) != (node, key) or self.stale:
                 return  # the user moved on while we were computing
-            self.fig = b.make_figure(cached, session["df"])
+            self.fig = b.make_figure(cached, session["df"], self.grouped)
             level = int(b.INTERVAL * 100)
             if node:
                 self.curve_caption = (
@@ -1158,5 +1293,9 @@ class State(rx.State):
                 self.curve_caption = (
                     f"Total effect: posterior mean of {target} when {source} is set to x, "
                     f"with a {level}% credible band. Grey points are the observed data."
+                )
+            if self.grouped:
+                self.curve_caption += (
+                    " Values are deviations from each group's mean (group differences removed)."
                 )
             self.has_curve = True

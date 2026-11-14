@@ -13,3 +13,4 @@ __pycache__/
 *.csv
 *.parquet
 !assets/dag_studio_test_data.csv
+!assets/dag_studio_panel_data.csv

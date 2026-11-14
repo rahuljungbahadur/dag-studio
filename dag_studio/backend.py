@@ -183,6 +183,116 @@ def to_dot(
 
 
 # --------------------------------------------------------------------------
+# Grouped (panel) data: remove each group's mean, so only differences within a
+# group are compared. This is the fixed-effects estimate: it works because a
+# regression on group-demeaned data gives the same slopes as one with a dummy
+# for every group, and it keeps discovery, validation and the fit on one table.
+# --------------------------------------------------------------------------
+
+NON_GAUSSIAN = ("bernoulli", "poisson", "negbinomial")
+SHORT_GROUP_ROWS = 5  # at or below this many rows per group, demeaned intervals run narrow
+
+
+@dataclass
+class GroupSummary:
+    headline: str  # e.g. "12 groups (region × store), 20 rows each, balanced"
+    warnings: list[str]
+    n_groups: int
+
+
+@dataclass
+class GroupedData:
+    df: pl.DataFrame  # the variables only, each minus its group's mean
+    summary: GroupSummary
+
+
+def apply_grouping(
+    frame: pl.DataFrame, keys: list[str], time_col: str, variables: list[str]
+) -> GroupedData:
+    """Remove group means from ``variables``.
+
+    ``keys`` are the group columns, coarse to fine (``["region", "store"]``): a
+    group is one combination of them, so a store name that repeats in several
+    regions still gives separate groups. ``time_col`` is optional; it is kept out
+    of the variables and used to check the panel. Rows with a missing group value,
+    and groups of a single row (which have nothing to compare within), are
+    dropped and reported, as are variables that never vary within a group.
+    """
+    if not keys:
+        raise ValueError("Choose at least one group column.")
+    if len(set(keys)) != len(keys):
+        raise ValueError("Each group column can only be used once.")
+    if time_col and time_col in keys:
+        raise ValueError("The time column cannot also be a group column.")
+    named = keys + ([time_col] if time_col else [])
+    missing = [c for c in named if c not in frame.columns]
+    if missing:
+        raise ValueError(f"Not columns of the data: {', '.join(missing)}.")
+    measured = [v for v in variables if v not in named]
+    frame = frame.select(list(dict.fromkeys(named + measured)))
+    warns: list[str] = []
+
+    before = frame.height
+    frame = frame.filter(pl.all_horizontal([pl.col(k).is_not_null() for k in keys]))
+    if frame.height < before:
+        warns.append(f"{before - frame.height} row(s) with a missing group value were dropped.")
+
+    singles = frame.filter(pl.len().over(keys) == 1)
+    if singles.height:
+        frame = frame.filter(pl.len().over(keys) > 1)
+        warns.append(
+            f"{singles.height} group(s) with a single row were dropped: with one row there is "
+            "nothing to compare within the group."
+        )
+
+    sizes = frame.group_by(keys).len()["len"]
+    n_groups = sizes.len()
+    if n_groups < 2:
+        raise ValueError(
+            f"These columns give {n_groups} group with two or more rows. Removing group means "
+            "needs at least two."
+        )
+    lo, hi, median = int(sizes.min()), int(sizes.max()), float(sizes.median())
+
+    demeaned = frame.select(
+        [(pl.col(v) - pl.col(v).mean().over(keys)).alias(v) for v in measured]
+    )
+    flat = [
+        v for v in measured
+        if float(demeaned[v].abs().max()) <= 1e-9 * max(float(frame[v].abs().max()), 1.0)
+    ]
+    kept = [v for v in measured if v not in flat]
+    if flat:
+        warns.append(
+            f"Removed because they never vary within a group: {', '.join(flat)}. Once group "
+            "differences are taken out, a group-level variable has nothing left to say."
+        )
+    if len(kept) < 2:
+        raise ValueError("Fewer than two variables vary within groups, so there is nothing to model.")
+    if demeaned.height < 20:
+        raise ValueError("Need at least 20 rows that sit in groups of two or more.")
+
+    if time_col:
+        repeated = int(frame.select(keys + [time_col]).is_duplicated().sum())
+        if repeated:
+            warns.append(
+                f"{repeated} row(s) repeat a (group, {time_col}) pair. Either time repeats within a "
+                "group, or different groups share a label (say store 1 in every region): list the "
+                "outer column first."
+            )
+    if median <= SHORT_GROUP_ROWS:
+        warns.append(
+            f"Groups have few rows (median {median:g}). With group means removed, the intervals "
+            "come out somewhat too narrow."
+        )
+
+    size_text = f"{lo} rows each, balanced" if lo == hi else f"{lo}–{hi} rows each (median {median:g})"
+    periods = f", {frame[time_col].n_unique()} periods" if time_col else ""
+    headline = f"{n_groups} groups ({' × '.join(keys)}), {size_text}{periods}"
+    return GroupedData(demeaned.select(kept), GroupSummary(headline, warns, n_groups))
+
+
+# --------------------------------------------------------------------------
 # Importing a DAG: DOT, pathmc spec syntax, or an "A->B, B->C" edge list
 # --------------------------------------------------------------------------
 
@@ -416,20 +526,36 @@ def _safe_name(name: str) -> str:
     return cleaned
 
 
-def load_table(path: str | Path) -> tuple[pl.DataFrame, list[str]]:
-    """Read a CSV or Parquet file and keep the usable numeric columns.
+def load_dataset(path: str | Path) -> tuple[pl.DataFrame, list[str], pl.DataFrame]:
+    """Read a CSV or Parquet file; return the usable numeric table, notes and the rest.
 
-    Returns the cleaned frame and human-readable notes about what changed.
+    The third value holds the columns that cannot be variables (text, dates),
+    row for row with the numeric table, because they may still say which group
+    a row belongs to.
     """
     path = Path(path)
     if path.suffix.lower() in {".parquet", ".pq"}:
         raw = pl.read_parquet(path)
     else:
         raw = pl.read_csv(path, infer_schema_length=10_000)
-    return clean_table(raw)
+    return clean_table_with_extras(raw)
+
+
+def load_table(path: str | Path) -> tuple[pl.DataFrame, list[str]]:
+    """Read a CSV or Parquet file and keep the usable numeric columns.
+
+    Returns the cleaned frame and human-readable notes about what changed.
+    """
+    df, notes, _ = load_dataset(path)
+    return df, notes
 
 
 def clean_table(raw: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
+    df, notes, _ = clean_table_with_extras(raw)
+    return df, notes
+
+
+def clean_table_with_extras(raw: pl.DataFrame) -> tuple[pl.DataFrame, list[str], pl.DataFrame]:
     notes: list[str] = []
 
     numeric = [c for c, dtype in raw.schema.items() if dtype.is_numeric()]
@@ -437,6 +563,7 @@ def clean_table(raw: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
     if dropped:
         notes.append(f"Ignored non-numeric columns: {', '.join(dropped)}")
     df = raw.select(numeric).cast(pl.Float64)
+    extras = raw.select(dropped)
 
     renames, used = {}, set()
     for col in df.columns:
@@ -456,7 +583,10 @@ def clean_table(raw: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
         notes.append(f"Ignored constant columns: {', '.join(constant)}")
 
     before = df.height
-    df = df.drop_nulls()
+    complete = df.select(pl.all_horizontal(pl.all().is_not_null())).to_series()
+    df = df.filter(complete)
+    if extras.width:  # keep the same rows in both; a file with no text columns has none to keep
+        extras = extras.filter(complete)
     if df.height < before:
         notes.append(f"Dropped {before - df.height} rows with missing values")
 
@@ -464,7 +594,7 @@ def clean_table(raw: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
         raise ValueError("Need at least two numeric, non-constant columns.")
     if df.height < 20:
         raise ValueError("Need at least 20 complete rows.")
-    return df, notes
+    return df, notes, extras
 
 
 # --------------------------------------------------------------------------
@@ -1099,11 +1229,23 @@ def prior_specs(
     return specs
 
 
-def family_problems(df: pl.DataFrame, families: dict[str, str]) -> list[str]:
-    """Columns whose values the chosen family cannot model."""
+def family_problems(
+    df: pl.DataFrame, families: dict[str, str], grouped: bool = False
+) -> list[str]:
+    """Columns whose values the chosen family cannot model.
+
+    With ``grouped`` the data have had group means removed, which turns a 0/1 or
+    count outcome into continuous values, so those families are ruled out.
+    """
     problems = []
     for node, family in sorted(families.items()):
         if node not in df.columns:
+            continue
+        if grouped and family in NON_GAUSSIAN:
+            problems.append(
+                f"{node}: the {family} family cannot be fitted once group means are removed "
+                "(demeaning makes a 0/1 or count outcome continuous). Clear the grouping to use it."
+            )
             continue
         values = df[node].to_numpy()
         if family == "bernoulli" and not np.isin(values, [0.0, 1.0]).all():
@@ -1156,6 +1298,7 @@ def fit_model(
     families: dict[str, str] | None = None,
     priors: dict[str, dict[str, str]] | None = None,
     progress: Progress | None = None,
+    grouped: bool = False,
 ):
     """Build the model with pathmc's ``BuildModelFromDAG`` (native style) and run MCMC.
 
@@ -1181,7 +1324,7 @@ def fit_model(
     unknown = sorted(f for f in families.values() if f not in FAMILIES)
     if unknown:
         raise ValueError(f"Unknown family: {', '.join(unknown)}.")
-    problems = family_problems(df, families)
+    problems = family_problems(df, families, grouped)
     if problems:
         raise ValueError(" ".join(problems))
     specs = prior_specs(edges, families, priors or {})
@@ -1534,8 +1677,11 @@ def edge_curve(model, df: pl.DataFrame, source: str, target: str) -> Curve:
     )
 
 
-def make_figure(curve: Curve, df: pl.DataFrame):
-    """Minimal Plotly figure: observed points, posterior mean, credible band."""
+def make_figure(curve: Curve, df: pl.DataFrame, grouped: bool = False):
+    """Minimal Plotly figure: observed points, posterior mean, credible band.
+
+    With ``grouped`` the values are deviations from each group's mean, and the axes say so.
+    """
     import plotly.graph_objects as go
 
     ink, accent = "#1f2933", "#2563eb"
@@ -1582,8 +1728,8 @@ def make_figure(curve: Curve, df: pl.DataFrame):
         paper_bgcolor="white",
         plot_bgcolor="white",
         font=dict(family="Inter, system-ui, sans-serif", size=12, color=ink),
-        xaxis=dict(title=curve.source, **axis),
-        yaxis=dict(title=curve.target, **axis),
+        xaxis=dict(title=curve.source + (" − group mean" if grouped else ""), **axis),
+        yaxis=dict(title=curve.target + (" − group mean" if grouped else ""), **axis),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=11)),
         showlegend=True,
     )
@@ -1662,5 +1808,52 @@ def test_file_table(n: int = 600, seed: int = 11) -> pl.DataFrame:
             "noise": noise.round(4),
             "repeat_purchase": repeat.astype(np.int64),
             "revenue": revenue.round(4),
+        }
+    )
+
+
+PANEL_TEST_FILE = Path(__file__).resolve().parent.parent / "assets" / "dag_studio_panel_data.csv"
+
+
+def panel_test_table(seed: int = 5) -> pl.DataFrame:
+    """Raw panel data with known structure, for trying the grouping controls by hand.
+
+    3 regions x 4 stores x 20 weeks. Store names (s1 to s4) repeat in every
+    region, so a store is only identified by region *and* store. Each group has a
+    level, ``g``, that also drives ``price``, ``demand`` and ``footfall``.
+
+        price -> demand (-0.8), promo -> demand (0.7), demand -> revenue (0.9),
+        price -> revenue (0.4).
+
+    ``footfall`` depends only on the group, so it is unrelated to everything once
+    group differences are removed; ignoring groups makes it look connected to
+    price and demand. ``store_size`` (constant within a store) and
+    ``region_income`` (constant within a region) are group-level variables, which
+    removing group means must drop.
+    """
+    rng = np.random.default_rng(seed)
+    regions, stores, weeks = ["north", "south", "east"], ["s1", "s2", "s3", "s4"], 20
+    rows = [(r, s_, w) for r in regions for s_ in stores for w in range(1, weeks + 1)]
+    n = len(rows)
+    region_effect = {r: rng.normal() for r in regions}
+    store_effect = {(r, s_): rng.normal() for r in regions for s_ in stores}
+    g = np.array([region_effect[r] + store_effect[(r, s_)] for r, s_, _ in rows])
+    price = 0.9 * g + rng.normal(size=n)
+    promo = rng.normal(size=n)
+    demand = -0.8 * price + 0.7 * promo + 1.0 * g + rng.normal(size=n)
+    revenue = 0.9 * demand + 0.4 * price + rng.normal(scale=0.8, size=n)
+    footfall = 0.8 * g + rng.normal(size=n)
+    return pl.DataFrame(
+        {
+            "region": [r for r, _, _ in rows],
+            "store": [s_ for _, s_, _ in rows],
+            "week": [w for _, _, w in rows],
+            "price": price.round(4),
+            "promo": promo.round(4),
+            "demand": demand.round(4),
+            "revenue": revenue.round(4),
+            "footfall": footfall.round(4),
+            "store_size": [round(50 + 10 * store_effect[(r, s_)], 1) for r, s_, _ in rows],
+            "region_income": [round(60 + 8 * region_effect[r], 1) for r, _, _ in rows],
         }
     )
