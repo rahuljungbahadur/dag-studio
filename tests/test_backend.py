@@ -844,3 +844,15 @@ def test_grouped_fit_recovers_the_effect_that_a_pooled_fit_misses(monkeypatch):
     assert abs(within.mean + 0.8) < 0.2
     assert abs(pooled.mean + 0.8) > 0.4
     assert within.lower < within.mean < within.upper
+
+
+def test_the_order_of_the_group_columns_makes_no_difference():
+    df, frame = panel_frame()
+    a = b.apply_grouping(frame, ["region", "store"], "week", list(df.columns))
+    c = b.apply_grouping(frame, ["store", "region"], "week", list(df.columns))
+    assert a.df.columns == c.df.columns and a.summary.n_groups == c.summary.n_groups == 12
+    assert all(np.allclose(a.df[x].to_numpy(), c.df[x].to_numpy()) for x in a.df.columns)
+    # The repeated-label warning says what to add, not what to put first.
+    alone = b.apply_grouping(frame, ["store"], "week", list(df.columns))
+    text = next(w for w in alone.summary.warnings if "repeat a (group" in w)
+    assert "add the column that tells them apart" in text and "first" not in text

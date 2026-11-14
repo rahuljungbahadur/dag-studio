@@ -61,11 +61,15 @@ instruction.
    and constant columns are ignored, and rows with missing values are dropped.
    The left panel lists exactly what was changed.
 
-   **Panel data?** Open *Panel data: group the rows* and pick the columns that
-   identify a group, from the broadest to the finest: `region`, then `store`.
-   Text columns and ID columns are both offered; a group is one *combination*,
-   so a store name used in several regions still gives separate groups. An
-   optional time column is kept out of the graph and used to check the panel.
+   **Panel data?** *Panel data: group the rows* is open as soon as a file is
+   loaded. If each row is one of many observations of the same thing (a store,
+   a country, a person), pick the column that names it; if your rows are
+   independent, skip it. If one column is not enough, pick several, for example
+   `region` and `store`. Text columns and ID columns are both offered. A group
+   is one *combination* of the columns you pick, so the order makes no
+   difference, and a store name used in several regions still gives separate
+   groups. An optional time column is kept out of the graph and used to check
+   the panel.
    Each group's mean is then removed from every variable (the fixed-effects
    estimate), and discovery, validation, the fit, the plots and R² all use that
    data, so group differences cannot create false links. On simulated data
@@ -73,7 +77,7 @@ instruction.
    group means gave 0.5 to 0.6. The panel summarises the result ("12 groups
    (region × store), 20 rows each, balanced") and warns about: rows with a
    missing group value (dropped), groups of one row (dropped), a repeated
-   (group, time) pair (usually a label shared by different groups), short
+   (group, time) pair (usually a label shared by different groups, fixed by adding the column that tells them apart), short
    groups (intervals come out somewhat too narrow), and variables that never
    vary within a group, such as a region-level income, which are removed because
    nothing is left of them once group differences are taken out. Changing the
@@ -204,7 +208,7 @@ drop zone too. Things to check:
   panel: 3 regions x 4 stores x 20 weeks, store names repeating across
   regions). First **Discover DAG** with no grouping: the graph is wrong (an
   edge reversed, `footfall` linked to `price`, `price → revenue` missing).
-  Open *Panel data*, add `region` then `store`, and set the time column to
+  In *Panel data*, add `region` and `store`, and set the time column to
   `week`. The summary reads "12 groups (region × store), 20 rows each,
   balanced, 20 periods"; `store_size` and `region_income` are removed with an
   explanation. Discover again: exactly `price → demand`, `promo → demand`,

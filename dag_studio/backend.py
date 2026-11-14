@@ -211,9 +211,10 @@ def apply_grouping(
 ) -> GroupedData:
     """Remove group means from ``variables``.
 
-    ``keys`` are the group columns, coarse to fine (``["region", "store"]``): a
-    group is one combination of them, so a store name that repeats in several
-    regions still gives separate groups. ``time_col`` is optional; it is kept out
+    ``keys`` are the group columns (say ``["region", "store"]``): a group is one
+    combination of their values, so a store name that repeats in several regions
+    still gives separate groups, and the order of ``keys`` makes no difference
+    to the result. ``time_col`` is optional; it is kept out
     of the variables and used to check the panel. Rows with a missing group value,
     and groups of a single row (which have nothing to compare within), are
     dropped and reported, as are variables that never vary within a group.
@@ -277,8 +278,8 @@ def apply_grouping(
         if repeated:
             warns.append(
                 f"{repeated} row(s) repeat a (group, {time_col}) pair. Either time repeats within a "
-                "group, or different groups share a label (say store 1 in every region): list the "
-                "outer column first."
+                "group, or different groups share a label (say store 1 in every region): add the "
+                "column that tells them apart, such as the region."
             )
     if median <= SHORT_GROUP_ROWS:
         warns.append(

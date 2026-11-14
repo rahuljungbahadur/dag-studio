@@ -86,12 +86,19 @@ def grouping_controls() -> rx.Component:
     )
     controls = rx.vstack(
         hint(
-            "Pick the columns that identify a group, from the broadest to the finest: region, "
-            "then store. A group is one combination, so a store name used in several regions "
-            "still gives separate groups. Each group's mean is then removed from every "
-            "variable, so only differences within a group are compared. This keeps group "
-            "differences from creating false links, and applies to discovery, validation "
-            "and the fit."
+            "Is each row one of many observations of the same thing, like a store, a country "
+            "or a person? Pick the column that names it. Skip this if your rows are "
+            "independent."
+        ),
+        hint(
+            "If one column is not enough, pick both: a store number used in every region needs "
+            "the region too. A group is one combination of the columns you pick, so the order "
+            "makes no difference."
+        ),
+        hint(
+            "Each group's mean is then removed from every variable, so only differences within "
+            "a group are compared. That stops group differences from creating false links, in "
+            "discovery, validation and the fit."
         ),
         rx.cond(
             State.grouped,

@@ -344,7 +344,7 @@ def test_choosing_group_columns_swaps_the_data_for_group_demeaned_variables():
     st = panel_state()
     State.add_group_col.fn(st, "region")
     State.add_group_col.fn(st, "store")
-    assert st.group_cols == ["region", "store"] and st.group_path == "region › store"
+    assert st.group_cols == ["region", "store"]
     assert st.group_headline.startswith("12 groups (region × store), 20 rows each")
     assert "region" not in st.group_candidates and "store" not in st.group_candidates
     State.set_time_col.fn(st, "week")
@@ -419,9 +419,9 @@ def test_grouped_wording_reaches_the_numbers():
 def test_loading_new_data_clears_the_grouping():
     st = panel_state()
     State.add_group_col.fn(st, "region")
-    st.grouping_open = True
+    st.grouping_open = False
     st._set_table(st._session()["raw"], [], "other")
-    assert st.group_cols == [] and st.time_col == "" and st.grouping_open is False
+    assert st.group_cols == [] and st.time_col == "" and st.grouping_open is True
     assert st.group_headline == "" and st.group_candidates == st.all_columns
 
 
@@ -436,3 +436,9 @@ def test_importing_a_dag_uses_the_variables_not_the_group_columns():
     State.set_time_col.fn(st, "week")
     State.import_pasted.fn(st)
     assert st.import_ok is False and "week" in st.import_message
+
+
+def test_the_grouping_section_is_open_once_data_is_loaded():
+    assert panel_state().grouping_open is True  # easy to find, not tucked away
+    State.toggle_grouping.fn(st := panel_state())
+    assert st.grouping_open is False and len(st.all_columns) > 0

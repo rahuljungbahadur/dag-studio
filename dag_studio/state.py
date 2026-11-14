@@ -213,7 +213,7 @@ class State(rx.State):
 
     # --- grouped (panel) data -----------------------------------------
     all_columns: list[str] = []  # every column a group or time column could be
-    group_cols: list[str] = []  # coarse to fine, e.g. region then store
+    group_cols: list[str] = []  # together they name a group, e.g. region and store; order is free
     time_col: str = ""
     group_pick: str = ""  # always empty: the "add a group column" select shows its placeholder
     group_headline: str = ""
@@ -424,7 +424,7 @@ class State(rx.State):
         self.all_columns = list(session["extras"].columns) + list(df.columns)
         self.group_cols, self.time_col = [], ""
         self.group_headline, self.group_warnings, self.group_error = "", [], ""
-        self.grouping_open = False
+        self.grouping_open = True  # open as soon as there is data, so it is easy to find
         self.filename, self.n_rows = filename, df.height
         self.columns, self.notes = df.columns, notes
         self.target = target or df.columns[-1]
@@ -521,10 +521,6 @@ class State(rx.State):
     @rx.var
     def time_value(self) -> str:
         return self.time_col or "(none)"
-
-    @rx.var
-    def group_path(self) -> str:
-        return " › ".join(self.group_cols)
 
     @rx.var
     def has_validation(self) -> bool:
@@ -679,7 +675,7 @@ class State(rx.State):
     # ------------------------------------------------------------------
 
     def _try_grouping(self, keys: list[str], time_col: str) -> bool:
-        """Group the rows by ``keys`` (coarse to fine). On a problem, change nothing."""
+        """Group the rows by the combination of ``keys``. On a problem, change nothing."""
         session = self._session()
         raw, extras = session["raw"], session["extras"]
         self.group_error = ""
@@ -731,7 +727,7 @@ class State(rx.State):
 
     @rx.event
     def add_group_col(self, column: str):
-        """Add a group column below the ones already chosen (they run coarse to fine)."""
+        """Add a group column. A group is a combination of the chosen columns, in any order."""
         if column and column not in self.group_cols and column != self.time_col:
             self._try_grouping(self.group_cols + [column], self.time_col)
 
