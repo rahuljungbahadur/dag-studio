@@ -210,6 +210,12 @@ class State(rx.State):
     progress_pct: int = 0
     progress_known: bool = False  # False: the task cannot say how far along it is
 
+    # --- importing a DAG ----------------------------------------------
+    paste_text: str = ""
+    import_message: str = ""
+    import_ok: bool = False
+    import_notes: list[str] = []
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -387,6 +393,7 @@ class State(rx.State):
         self.positions, self.descriptions = {}, {}
         self.families, self.prior_text = {}, {}
         self.refused_cycle, self.violations_open, self.n_found = [], False, 0
+        self.paste_text, self.import_message, self.import_notes = "", "", []
         self._violations, self.validated_sig, self.selected_violation = [], "", ""
         self.verdict = self.verdict_detail = self.violation_summary = ""
         self.selected_nodes, self.selected_edge = [], ""
@@ -589,6 +596,87 @@ class State(rx.State):
             self.error = f"Could not read {name}: {exc}"
             return
         self._set_table(df, notes, Path(name).name)
+
+    # ------------------------------------------------------------------
+    # Importing a DAG
+    # ------------------------------------------------------------------
+
+    def _apply_import(self, result: "b.ImportedDag") -> None:
+        """Replace the graph's edges with an imported DAG, as discovery would."""
+        session = self._session()
+        used = {n for e in result.edges for n in (e.source, e.target)}
+        restored = sorted(n for n in used if n in self.removed)
+        if restored:  # an edge needs its nodes, so bring back any the user had removed
+            self.removed = [n for n in self.removed if n not in restored]
+            self.nodes = self.nodes + restored
+        self.edges = [dataclasses.asdict(e) for e in result.edges]
+        self.descriptions = {**self.descriptions, **result.descriptions}
+        keys = {e.key for e in result.edges}
+        self.flagged_edges = list(
+            dict.fromkeys([k for k in self.flagged_edges if k in keys] + result.flagged_edges)
+        )
+        self.flagged_nodes = list(
+            dict.fromkeys(self.flagged_nodes + [n for n in result.flagged_nodes if n in self.nodes])
+        )
+        # The graph is new: nothing fitted or validated before describes it.
+        session.pop("model", None)
+        session["curves"] = {}
+        self.selected_nodes, self.selected_edge, self.refused_cycle = [], "", []
+        self.fitted = self.stale = self.has_curve = self.has_equation = False
+        self.evidence_caption = ""
+        self._violations, self.validated_sig, self.selected_violation = [], "", ""
+        self.verdict = self.verdict_detail = self.violation_summary = ""
+        self.n_found = 0
+        self._refresh(relayout=True)
+
+    def _import_text(self, text: str) -> None:
+        self.import_ok, self.import_notes = False, []
+        if not self.n_rows:
+            self.import_message = "Load data first: the graph's nodes are the dataset's columns."
+            return
+        try:
+            result = b.parse_dag_text(text, list(self.columns))
+        except ValueError as exc:
+            self.import_message = str(exc)
+            return
+        self._apply_import(result)
+        n = len(result.edges)
+        self.import_ok = True
+        self.import_message = (
+            f"Imported {n} edge{'s' if n != 1 else ''} from {result.format}. "
+            "The previous edges were replaced."
+        )
+        self.import_notes = result.notes
+        self.paste_text = ""
+        self.error = ""
+
+    @rx.event
+    def set_paste_text(self, value: str):
+        self.paste_text = value
+
+    @rx.event
+    def import_pasted(self):
+        """Import the DAG typed or pasted into the box (DOT, spec syntax or edge list)."""
+        if not self.paste_text.strip():
+            self.import_ok, self.import_notes = False, []
+            self.import_message = "Paste a DAG first."
+            return
+        self._import_text(self.paste_text)
+
+    @rx.event
+    async def import_file(self, files: list[rx.UploadFile]):
+        """Import a DOT (.dot / .gv) or text file holding a DAG."""
+        if not files:
+            return
+        upload = files[0]
+        name = getattr(upload, "name", None) or getattr(upload, "filename", None) or "dag.dot"
+        try:
+            text = (await upload.read()).decode("utf-8-sig")
+        except UnicodeDecodeError:
+            self.import_ok, self.import_notes = False, []
+            self.import_message = f"{Path(name).name} is not a text file."
+            return
+        self._import_text(text)
 
     @rx.event
     def load_demo(self):

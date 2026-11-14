@@ -1,5 +1,7 @@
 """Backend tests. The MCMC test is slow (~30 s); run `pytest -m "not slow"` to skip it."""
 
+import re
+
 import numpy as np
 import polars as pl
 import pytest
@@ -557,3 +559,112 @@ def test_fit_reports_progress_and_the_hook_does_not_leak(monkeypatch):
     fit = b.fit_model(df, nodes, edges, "demand", progress=fallback)
     assert [label for label, _ in fallback.log] == [b.fit_step(1)]
     assert fit.idata is not None
+
+
+IMPORT_COLUMNS = ["ad_spend", "season", "web_visits", "orders", "revenue", "v_2024_price_index", "noise"]
+
+
+def imported(text: str) -> b.ImportedDag:
+    return b.parse_dag_text(text, IMPORT_COLUMNS)
+
+
+def pairs(result: b.ImportedDag) -> set[tuple[str, str, bool]]:
+    return {(e.source, e.target, e.directed) for e in result.edges}
+
+
+def test_import_spec_syntax():
+    result = imported("web_visits ~ ad_spend + season\norders ~ web_visits\nrevenue ~ orders")
+    assert result.format == "spec" and result.notes == []
+    assert pairs(result) == {
+        ("ad_spend", "web_visits", True), ("season", "web_visits", True),
+        ("web_visits", "orders", True), ("orders", "revenue", True),
+    }
+
+
+def test_import_spec_keeps_only_the_structure_and_says_so():
+    result = imported(
+        "revenue ~ adstock(orders, decay=t) + season:ad_spend + 2*noise\n"
+        "web_visits ~ lag(web_visits) + lag(season)\n"
+        "ad_spend ~~ season"
+    )
+    assert pairs(result) == {
+        ("orders", "revenue", True), ("season", "revenue", True), ("ad_spend", "revenue", True),
+        ("noise", "revenue", True), ("season", "web_visits", True),  # own past is not a parent
+    }
+    assert len(result.notes) == 2
+    assert "Only the structure" in result.notes[0] and "residual covariance" in result.notes[1]
+
+
+def test_import_dot_with_chains_comments_and_undirected_edges():
+    result = imported(
+        "// hand drawn\n/* v2 */\ndigraph G { rankdir=LR; ad_spend -> web_visits -> orders;\n"
+        '  "v_2024_price_index" -> orders; season -- web_visits [style=dashed] }'
+    )
+    assert result.format == "DOT"
+    assert pairs(result) == {
+        ("ad_spend", "web_visits", True), ("web_visits", "orders", True),
+        ("v_2024_price_index", "orders", True), ("season", "web_visits", False),
+    }
+    assert result.notes == ["1 undirected edge(s) were imported as dashed edges."]
+    # A directed edge for the same pair wins over an undirected one.
+    both = imported("digraph { orders -> revenue; orders -- revenue }")
+    assert pairs(both) == {("orders", "revenue", True)}
+
+
+def test_import_edge_list():
+    result = imported("ad_spend->web_visits, web_visits->orders\norders->revenue;")
+    assert result.format == "edge list"
+    assert pairs(result) == {
+        ("ad_spend", "web_visits", True), ("web_visits", "orders", True),
+        ("orders", "revenue", True),
+    }
+
+
+def test_import_matches_names_the_way_an_upload_cleans_them():
+    result = imported('digraph { "ad spend" -> "web visits"; "2024 price index" -> orders }')
+    assert pairs(result) == {
+        ("ad_spend", "web_visits", True), ("v_2024_price_index", "orders", True),
+    }
+    assert "Matched ad spend to the column ad_spend." in result.notes
+
+
+def test_import_round_trips_the_apps_own_export():
+    edges = [b.Edge("ad_spend", "web_visits"), b.Edge("web_visits", "orders"),
+             b.Edge("season", "web_visits", False)]
+    notes = {"orders": 'Orders "placed"\nincl. C:\\x -> y [see]', "noise": "unused", "season": "  "}
+    dot = b.to_dot(IMPORT_COLUMNS, edges, ["node orders", "edge season -- web_visits"], notes)
+    result = imported(dot)
+    assert pairs(result) == {(e.source, e.target, e.directed) for e in edges}
+    assert result.descriptions == {"orders": notes["orders"], "noise": "unused"}
+    assert result.flagged_nodes == ["orders"]
+    assert result.flagged_edges == ["season~web_visits"]
+
+
+def test_import_ignores_tooltips_on_edges():
+    result = imported('digraph { orders [tooltip="mine"]; ad_spend -> revenue [tooltip="not a node note"] }')
+    assert result.descriptions == {"orders": "mine"}
+
+
+@pytest.mark.parametrize(
+    "text,message",
+    [
+        ("orders ~ web_visitz + price", "web_visitz (did you mean web_visits?), price. Nothing"),
+        ("digraph { orders -> revenue; revenue -> web_visits; web_visits -> orders }",
+         "cycle: revenue → web_visits → orders → revenue"),
+        ("orders->revenue, revenue->orders", "contains a cycle"),
+        ("orders ~ orders + season", "orders → orders is a self-loop"),
+        ("digraph { orders }", "No edges found"),
+        ("hello there", "Could not tell what format"),
+        ("digraph { orders -> }", "Could not read the DOT"),
+        ("orders ~ ", "Could not read the spec"),
+        ("Q ~ 1", "Could not read the spec"),
+    ],
+)
+def test_import_refuses_bad_input_with_a_reason(text, message):
+    with pytest.raises(ValueError, match=re.escape(message)):
+        imported(text)
+
+
+def test_import_refuses_oversized_text():
+    with pytest.raises(ValueError, match="too large"):
+        imported("a->b," * b.MAX_IMPORT_CHARS)

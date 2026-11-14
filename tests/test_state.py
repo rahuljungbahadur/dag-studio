@@ -235,3 +235,89 @@ def test_set_progress_and_show_progress():
     assert st.progress_known is False and st.progress_pct == 0 and st.show_progress is True
     st.progress_label = ""
     assert st.show_progress is False
+
+
+COLUMNS = ["a", "b", "c", "d", "x"]
+
+
+def data_state() -> State:
+    st = State(_reflex_internal_init=True)
+    st.columns, st.n_rows, st.nodes, st.target = list(COLUMNS), 100, list(COLUMNS), "c"
+    st._session().clear()
+    st._refresh(relayout=True)
+    return st
+
+
+def edge_pairs(st: State) -> set[tuple[str, str, bool]]:
+    return {(e["source"], e["target"], e["directed"]) for e in st.edges}
+
+
+def test_importing_replaces_the_edges_and_resets_what_depended_on_them():
+    st = data_state()
+    st.edges = [{"source": "a", "target": "b", "directed": True}]
+    st.fitted, st.validated_sig, st.n_found = True, "old", 2
+    st._violations = [{"key": "a~c", "x": "a", "y": "c", "given": [], "r": 0.3, "p": 0.01}]
+    st._session()["model"] = object()
+    st.paste_text = "c ~ a + b"
+    State.import_pasted.fn(st)
+    assert edge_pairs(st) == {("a", "c", True), ("b", "c", True)}
+    assert st.import_ok and st.import_message.startswith("Imported 2 edges from spec")
+    assert st.paste_text == ""  # a successful import clears the box
+    assert st.fitted is False and "model" not in st._session()
+    assert st.has_validation is False and st.violation_views == []
+    assert [e.id for e in st.edge_views] == ["a~c", "b~c"]  # the graph was redrawn
+
+
+def test_import_brings_back_removed_nodes_and_merges_descriptions_and_flags():
+    st = data_state()
+    st.nodes, st.removed = ["a", "b", "c", "d"], ["x"]
+    st.descriptions = {"d": "kept"}
+    st.flagged_nodes, st.flagged_edges = ["d"], ["a~b", "gone~edge"]
+    st.paste_text = (
+        'digraph { x -> c; a -> b; "d" [tooltip="note"]; "x" [tooltip="restored"] }\n'
+        "// review: node a\n// review: edge a -- b"
+    )
+    State.import_pasted.fn(st)
+    assert st.removed == [] and "x" in st.nodes  # x is in the graph again
+    assert st.descriptions == {"d": "note", "x": "restored"}  # the import wins; the rest is kept
+    assert st.flagged_nodes == ["d", "a"]
+    assert st.flagged_edges == ["a~b"]  # the flag on an edge that no longer exists is dropped
+
+
+def test_a_failed_import_changes_nothing_and_explains():
+    st = data_state()
+    st.edges = [{"source": "a", "target": "b", "directed": True}]
+    st.paste_text = "c ~ zzz"
+    State.import_pasted.fn(st)
+    assert st.import_ok is False and "zzz" in st.import_message
+    assert edge_pairs(st) == {("a", "b", True)}
+    assert st.paste_text == "c ~ zzz"  # kept, so it can be corrected
+
+    State.set_paste_text.fn(st, "   ")
+    State.import_pasted.fn(st)
+    assert st.import_message == "Paste a DAG first."
+
+
+def test_import_needs_data_first():
+    st = State(_reflex_internal_init=True)
+    st.paste_text = "b ~ a"
+    State.import_pasted.fn(st)
+    assert st.import_ok is False and "Load data first" in st.import_message
+
+
+def test_import_file_reads_text_and_rejects_binary():
+    import asyncio
+
+    class Upload:
+        def __init__(self, name, data):
+            self.name, self._data = name, data
+
+        async def read(self):
+            return self._data
+
+    st = data_state()
+    asyncio.run(State.import_file.fn(st, [Upload("g.dot", b"\xef\xbb\xbfdigraph { a -> b }")]))
+    assert st.import_ok and edge_pairs(st) == {("a", "b", True)}  # a UTF-8 BOM is fine
+    asyncio.run(State.import_file.fn(st, [Upload("pic.png", b"\x89PNG\r\n\x1a\n\xff\xfe")]))
+    assert st.import_ok is False and "not a text file" in st.import_message
+    assert edge_pairs(st) == {("a", "b", True)}

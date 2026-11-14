@@ -7,6 +7,7 @@ these functions and stores their (serialisable) results.
 
 from __future__ import annotations
 
+import difflib
 import math
 import re
 import threading
@@ -179,6 +180,227 @@ def to_dot(
     for item in flagged or []:
         lines.append(f"// review: {item}")
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Importing a DAG: DOT, pathmc spec syntax, or an "A->B, B->C" edge list
+# --------------------------------------------------------------------------
+
+MAX_IMPORT_CHARS = 500_000
+
+
+@dataclass
+class ImportedDag:
+    edges: list[Edge]
+    descriptions: dict[str, str]  # from DOT ``tooltip`` attributes, which export_dot writes
+    flagged_nodes: list[str]  # from the ``// review:`` comments export_dot writes
+    flagged_edges: list[str]
+    notes: list[str]
+    format: str  # "DOT", "spec" or "edge list"
+
+
+def _strip_leading_comments(text: str) -> str:
+    """Drop comment lines before the graph header, which pathmc's DOT reader rejects."""
+    text = text.lstrip()
+    while True:
+        if text.startswith(("//", "#")):
+            newline = text.find("\n")
+            text = text[newline + 1 :].lstrip() if newline != -1 else ""
+        elif text.startswith("/*"):
+            end = text.find("*/")
+            text = text[end + 2 :].lstrip() if end != -1 else ""
+        else:
+            return text
+
+
+def detect_dag_format(text: str) -> str:
+    """"DOT", "spec" (``Y ~ X + M``) or "edge list" (``X->M, M->Y``); ValueError if none."""
+    body = _strip_leading_comments(text)
+    if re.match(r"(strict\s+)?(di)?graph\b", body, re.IGNORECASE):
+        return "DOT"
+    if "~" in body:
+        return "spec"
+    if "->" in body:
+        return "edge list"
+    raise ValueError(
+        "Could not tell what format this is. Paste DOT (digraph { X -> M; M -> Y }), "
+        "the spec syntax (M ~ X, then Y ~ M + X on the next line) or an edge list "
+        "(X->M, M->Y)."
+    )
+
+
+def _read_dot(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Directed and undirected edges from DOT, via pathmc's own reader."""
+    from pathmc._dot import parse_dot  # the reader pathmc.dag_to_spec uses
+
+    _, directed, undirected = parse_dot(text)
+    singles = [e for e in undirected if len(e) == 1]
+    if singles:
+        raise ValueError(f"{next(iter(singles[0]))} -- {next(iter(singles[0]))} is a self-loop.")
+    return sorted(directed), sorted(tuple(sorted(e)) for e in undirected)  # type: ignore[misc]
+
+
+def _read_spec(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parent -> child edges from the spec syntax, via pathmc's parser, and notes."""
+    from pathmc.parse import parse_spec
+
+    spec = parse_spec(text)
+    directed: list[tuple[str, str]] = []
+    details = False
+    for regression in spec.regressions:
+        for term in regression.terms:
+            if term.interaction_of:
+                parents, details = list(term.interaction_of), True
+            elif term.lag_of:
+                details = True
+                # A variable's own past is not another node; any other lag is a parent.
+                parents = [] if term.lag_of == regression.lhs else [term.lag_of]
+            else:
+                parents = [term.variable]
+                details = details or bool(
+                    term.transform or term.categorical or term.basis
+                    or term.fixed_value is not None
+                )
+            directed.extend((v, regression.lhs) for v in parents)
+    notes = []
+    if details:
+        notes.append(
+            "Only the structure was imported: transforms, lags, interactions, categorical "
+            "terms and fixed coefficients are not carried over."
+        )
+    if spec.residual_covs:
+        notes.append(
+            f"{len(spec.residual_covs)} residual covariance(s) (~~) were ignored: the graph "
+            "has no bidirected edges."
+        )
+    if spec.defined_params:
+        notes.append(f"{len(spec.defined_params)} defined parameter(s) (:=) were ignored.")
+    return directed, notes
+
+
+def _unescape_dot(text: str) -> str:
+    return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1), text)
+
+
+_DOT_QUOTED = r'"(?:[^"\\]|\\.)*"'
+_DOT_NODE_STATEMENT = re.compile(
+    rf"({_DOT_QUOTED}|[A-Za-z_]\w*)\s*\[((?:[^\]\"]|{_DOT_QUOTED})*)\]"
+)
+_DOT_TOOLTIP = re.compile(rf"tooltip\s*=\s*({_DOT_QUOTED}|[^\s,\]]+)")
+
+
+def _dot_id(token: str) -> str:
+    return _unescape_dot(token[1:-1]) if token.startswith('"') else token
+
+
+def _dot_descriptions(text: str) -> dict[str, str]:
+    """``"node" [tooltip="..."]`` statements, which is how ``to_dot`` stores descriptions."""
+    found: dict[str, str] = {}
+    for match in _DOT_NODE_STATEMENT.finditer(text):
+        if text[: match.start()].rstrip().endswith(("->", "--")):
+            continue  # an edge's attributes, not a node's
+        tooltip = _DOT_TOOLTIP.search(match.group(2))
+        if tooltip:
+            found[_dot_id(match.group(1))] = _dot_id(tooltip.group(1))
+    return found
+
+
+def _dot_review_flags(text: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """``// review: node a`` and ``// review: edge a -- b`` comments, as ``to_dot`` writes."""
+    nodes = re.findall(r"^//\s*review:\s*node\s+(.+?)\s*$", text, re.MULTILINE)
+    edges = re.findall(r"^//\s*review:\s*edge\s+(.+?)\s+--\s+(.+?)\s*$", text, re.MULTILINE)
+    return nodes, edges
+
+
+def parse_dag_text(text: str, columns: list[str]) -> ImportedDag:
+    """Read a DAG from DOT, the pathmc spec syntax or an edge list.
+
+    Parsing is pathmc's own: ``parse_dot`` for DOT and edge lists (an edge list
+    is the body of a ``digraph``), ``parse_spec`` for ``Y ~ X + M`` lines. Names
+    are matched to ``columns``, then to ``columns`` after the same cleaning an
+    upload gets (``ad spend`` -> ``ad_spend``). Anything that cannot be imported
+    whole raises a ValueError saying why, rather than importing part of a graph.
+    """
+    if len(text) > MAX_IMPORT_CHARS:
+        raise ValueError("That text is too large to be a DAG.")
+    kind = detect_dag_format(text)
+    notes: list[str] = []
+    undirected: list[tuple[str, str]] = []
+    try:
+        if kind == "DOT":
+            directed, undirected = _read_dot(_strip_leading_comments(text))
+        elif kind == "edge list":
+            body = re.sub(r"[,\n]+", ";", text.strip())
+            directed, undirected = _read_dot(f"digraph {{ {body} }}")
+        else:
+            directed, notes = _read_spec(text)
+    except ImportError as exc:
+        raise ValueError(f"This version of pathmc cannot read {kind}: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - pathmc's ParseError, ValueError and friends
+        raise ValueError(f"Could not read the {kind}: {exc}") from exc
+
+    # Match every name an edge uses to a column.
+    used = list(dict.fromkeys(n for pair in directed + undirected for n in pair))
+    mapping: dict[str, str] = {}
+    unknown: list[str] = []
+    for name in used:
+        if name in columns:
+            mapping[name] = name
+        elif _safe_name(name) in columns:
+            mapping[name] = _safe_name(name)
+            notes.append(f"Matched {name} to the column {mapping[name]}.")
+        else:
+            unknown.append(name)
+    if unknown:
+        hints = []
+        for name in unknown:
+            close = difflib.get_close_matches(name, columns, n=1, cutoff=0.6)
+            hints.append(f"{name} (did you mean {close[0]}?)" if close else name)
+        shown = ", ".join(columns[:15]) + ("…" if len(columns) > 15 else "")
+        raise ValueError(
+            f"These variables are not columns of the loaded data: {', '.join(hints)}. "
+            f"Nothing was imported. The columns are: {shown}."
+        )
+
+    directed = [(mapping[u], mapping[v]) for u, v in directed]
+    undirected = [(mapping[u], mapping[v]) for u, v in undirected]
+    for u, v in directed + undirected:
+        if u == v:
+            raise ValueError(f"{u} → {u} is a self-loop. Nothing was imported.")
+    if not directed and not undirected:
+        raise ValueError("No edges found. Nothing was imported.")
+
+    edges = [Edge(u, v, True) for u, v in dict.fromkeys(directed)]
+    cycle = find_cycle(edges)
+    if cycle:
+        raise ValueError(
+            f"The graph contains a cycle: {' → '.join(cycle + [cycle[0]])}. Nothing was imported."
+        )
+    seen = {e.key for e in edges}
+    for u, v in undirected:
+        key = edge_key(u, v)
+        if key not in seen:  # a directed edge for the same pair wins
+            seen.add(key)
+            edges.append(Edge(*sorted((u, v)), False))
+
+    descriptions: dict[str, str] = {}
+    flagged_nodes: list[str] = []
+    flagged_edges: list[str] = []
+    if kind == "DOT":
+        for name, note in _dot_descriptions(text).items():
+            column = mapping.get(name) or (name if name in columns else None)
+            if column and note.strip():
+                descriptions[column] = note
+        review_nodes, review_edges = _dot_review_flags(text)
+        flagged_nodes = [mapping[n] for n in review_nodes if n in mapping]
+        flagged_edges = [
+            edge_key(mapping[a], mapping[c])
+            for a, c in review_edges
+            if a in mapping and c in mapping and edge_key(mapping[a], mapping[c]) in seen
+        ]
+    if undirected:
+        notes.append(f"{len(undirected)} undirected edge(s) were imported as dashed edges.")
+    return ImportedDag(edges, descriptions, flagged_nodes, flagged_edges, notes, kind)
 
 
 # --------------------------------------------------------------------------

@@ -111,16 +111,58 @@ def data_step() -> rx.Component:
     )
 
 
+def import_controls() -> rx.Component:
+    """Import a DAG from a DOT file, or from pasted DOT, spec syntax or an edge list."""
+    return rx.vstack(
+        label("Or import a DAG"),
+        rx.upload(
+            rx.text("Drop a .dot file, or click to browse", size="1", color=MUTED),
+            id="dagfile",
+            accept={
+                "text/vnd.graphviz": [".dot", ".gv"],
+                "text/plain": [".dot", ".gv", ".txt"],
+                "application/octet-stream": [".dot", ".gv"],
+            },
+            max_files=1,
+            multiple=False,
+            on_drop=State.import_file(rx.upload_files(upload_id="dagfile")),
+            border=f"1px dashed {EDGE}", border_radius="6px", padding="10px 8px",
+            text_align="center", cursor="pointer", background="white",
+        ),
+        rx.text_area(
+            value=State.paste_text,
+            on_change=State.set_paste_text,
+            placeholder="…or paste one, in the spec syntax:\nM ~ X\nY ~ M + X\n\nor as DOT / an edge list:\ndigraph { X -> M; M -> Y }\nX->M, M->Y",
+            size="1", rows="5", resize="vertical", width="100%",
+            style={"fontFamily": MONO, "fontSize": "12px"},
+        ),
+        rx.button(
+            "Import pasted DAG", on_click=State.import_pasted, size="1", variant="soft",
+            color_scheme="gray", disabled=State.paste_text == "",
+        ),
+        rx.cond(
+            State.import_message != "",
+            rx.text(
+                State.import_message, size="1", line_height="1.5",
+                color=rx.cond(State.import_ok, GREEN, RED),
+            ),
+        ),
+        rx.foreach(State.import_notes, lambda note: hint(note)),
+        spacing="2", width="100%", align="stretch", padding_top="6px",
+    )
+
+
 def discover_step() -> rx.Component:
     return step(
-        2, "Discover",
-        "Pick the outcome you care about, then let TBFPC propose a graph. This replaces "
-        "the current edges.",
+        2, "Discover or import",
+        "Pick the outcome you care about, then let TBFPC propose a graph, or import one you "
+        "already have. Either replaces the current edges.",
         rx.select(State.columns, value=State.target, on_change=State.set_target, size="1"),
         rx.button(
             "Discover DAG", on_click=State.discover, disabled=State.is_busy,
             size="1", variant="solid", color_scheme="gray", high_contrast=True,
         ),
+        import_controls(),
     )
 
 
