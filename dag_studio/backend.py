@@ -1085,6 +1085,26 @@ def validate_graph(
     return Validation(verdict, detail, tone, len(frame), alpha, violations, n_collapsed)
 
 
+def violation_given(given: list[str]) -> str:
+    return f"given {', '.join(given)}" if given else "with nothing held fixed"
+
+
+def violation_stats(partial_corr: float, p_value: float) -> str:
+    return f"partial r = {partial_corr:.2f} · p = {p_value:.2g}"
+
+
+def validation_summary(result: Validation) -> str:
+    n = len(result.violations)
+    text = (
+        f"{n} of {result.n_tests} implied independences {'is' if n == 1 else 'are'} violated. "
+        f"At α = {result.alpha:g}, about {result.expected_by_chance:.1f} would be flagged by "
+        "chance alone."
+    )
+    if result.n_collapsed:
+        text += f" {result.n_collapsed} test(s) skipped: a conditioning variable was redundant."
+    return text
+
+
 def dag_to_spec_from_edges(edges: list[Edge]) -> str:
     import pathmc
 
@@ -1291,6 +1311,54 @@ def builder_code(
     return "\n".join(lines)
 
 
+@dataclass
+class FitPlan:
+    """Everything a fit takes from the app's settings, checked and in a fixed order."""
+
+    used: list[str]  # the columns the model uses, sorted
+    pairs: list[tuple[str, str]]  # (parent, child), sorted: the same graph always fits the same way
+    families: dict[str, str]  # non-gaussian families, for nodes that have parents
+    specs: dict[str, tuple[str, dict[str, float]]]  # prior overrides, see prior_specs
+
+    @property
+    def dag(self) -> str:
+        return ", ".join(f"{u}->{v}" for u, v in self.pairs)
+
+
+def prepare_fit(
+    df: pl.DataFrame,
+    nodes: list[str],
+    edges: list[Edge],
+    target: str,
+    families: dict[str, str] | None = None,
+    priors: dict[str, dict[str, str]] | None = None,
+    grouped: bool = False,
+) -> FitPlan:
+    """Check the graph and settings, and say exactly what the fit will use.
+
+    Raises a ValueError that says what to fix. The edges are put in sorted order,
+    so pathmc builds its equations in the same order however the graph was
+    edited, and so the exported script (which sorts the same way) fits identically.
+    """
+    problems = graph_problems(nodes, edges, target)
+    if problems:
+        raise ValueError(" ".join(problems))
+
+    children = {e.target for e in edges}
+    families = {
+        n: f for n, f in (families or {}).items() if n in children and f != "gaussian"
+    }
+    unknown = sorted(f for f in families.values() if f not in FAMILIES)
+    if unknown:
+        raise ValueError(f"Unknown family: {', '.join(unknown)}.")
+    problems = family_problems(df, families, grouped)
+    if problems:
+        raise ValueError(" ".join(problems))
+    specs = prior_specs(edges, families, priors or {})
+    used = sorted({e.source for e in edges} | {e.target for e in edges})
+    return FitPlan(used, sorted((e.source, e.target) for e in edges), families, specs)
+
+
 def fit_model(
     df: pl.DataFrame,
     nodes: list[str],
@@ -1314,27 +1382,11 @@ def fit_model(
     import pathmc
     from pymc_extras.prior import Prior
 
-    problems = graph_problems(nodes, edges, target)
-    if problems:
-        raise ValueError(" ".join(problems))
-
-    children = {e.target for e in edges}
-    families = {
-        n: f for n, f in (families or {}).items() if n in children and f != "gaussian"
-    }
-    unknown = sorted(f for f in families.values() if f not in FAMILIES)
-    if unknown:
-        raise ValueError(f"Unknown family: {', '.join(unknown)}.")
-    problems = family_problems(df, families, grouped)
-    if problems:
-        raise ValueError(" ".join(problems))
-    specs = prior_specs(edges, families, priors or {})
-
-    used = sorted({e.source for e in edges} | {e.target for e in edges})
-    dag = ", ".join(f"{e.source}->{e.target}" for e in edges)
+    plan = prepare_fit(df, nodes, edges, target, families, priors, grouped)
+    families, specs, dag = plan.families, plan.specs, plan.dag
     builder = pathmc.BuildModelFromDAG(
         dag=dag,
-        df=df.select(used).to_pandas(),
+        df=df.select(plan.used).to_pandas(),
         target=target,
         style="native",
         families=families or None,
@@ -1416,6 +1468,61 @@ class FitQuality:
                 "estimates may be biased. Stronger priors often help."
             )
         return out
+
+
+CONVERGED_NOTE = "The sampler converged: these estimates can be trusted as fits."
+R2_HEADING = "Variance explained by each node's parents (Bayesian R², 89% interval)"
+R2_HEADING_GROUPED = (
+    "Variance explained by each node's parents within groups, after group means are removed "
+    "(Bayesian R², 89% interval)"
+)
+
+
+@dataclass
+class QualityRow:
+    """One node's R² as the Fit quality section shows it."""
+
+    node: str
+    family: str  # empty for gaussian
+    r2: str
+    interval: str
+    bar: str  # width of the bar, e.g. "76%"
+    is_target: bool
+
+
+def r2_text(node: NodeFit) -> str:
+    return f"{node.r2:.2f} [{node.lower:.2f}, {node.upper:.2f}]"
+
+
+def quality_rows(quality: FitQuality, target: str) -> list[QualityRow]:
+    """The outcome first, then the other nodes alphabetically."""
+    nodes = sorted(quality.nodes, key=lambda n: (n.node != target, n.node))
+    return [
+        QualityRow(
+            node=n.node,
+            family="" if n.family == "gaussian" else n.family,
+            r2=f"{n.r2:.2f}",
+            interval=f"[{n.lower:.2f}, {n.upper:.2f}]",
+            bar=f"{max(n.r2, 0) * 100:.0f}%",
+            is_target=n.node == target,
+        )
+        for n in nodes
+    ]
+
+
+def quality_diagnostics(quality: FitQuality, chains: int, draws: int) -> str:
+    return (
+        f"{chains} chains × {draws} draws · largest r̂ {quality.max_rhat:.3f} · "
+        f"smallest ESS {quality.min_ess:.0f} · {quality.divergences} divergences"
+    )
+
+
+def edge_tooltip(source: str, target: str, directed: bool, term: Term | None = None) -> str:
+    """"a → b", with the fitted direct coefficient once there is one."""
+    text = f"{source} {'→' if directed else '—'} {target}"
+    if term is not None:
+        text += f": direct coefficient {term.mean:.3f} [{term.lower:.3f}, {term.upper:.3f}]"
+    return text
 
 
 def _draws(posterior, name: str) -> np.ndarray:

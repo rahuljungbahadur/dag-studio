@@ -405,9 +405,20 @@ def fit_step() -> rx.Component:
             hint("Finish step 3 first.", color=AMBER),
         ),
         rx.cond(State.stale, hint("The model changed since the last fit.", color=AMBER)),
-        rx.button(
-            "Export DOT", on_click=State.export_dot, disabled=~State.has_data,
-            size="1", variant="ghost", color_scheme="gray",
+        rx.hstack(
+            rx.button(
+                "Export DOT", on_click=State.export_dot, disabled=~State.has_data,
+                size="1", variant="ghost", color_scheme="gray",
+            ),
+            rx.button(
+                "Export code", on_click=State.export_code, disabled=~State.can_export_code,
+                size="1", variant="ghost", color_scheme="gray",
+            ),
+            spacing="3",
+        ),
+        hint(
+            "Export code downloads a Python script that loads the DAG as a digraph, fits it "
+            "with the same settings and seed, and prints and saves what you see here."
         ),
     )
 
@@ -820,16 +831,10 @@ def fit_quality_section() -> rx.Component:
                     lambda w: rx.text(w, size="1", line_height="1.5",
                                       color=rx.cond(State.fit_trouble, RED, AMBER)),
                 ),
-                hint("The sampler converged: these estimates can be trusted as fits.",
-                     color=GREEN),
+                hint(b.CONVERGED_NOTE, color=GREEN),
             ),
             rx.text(
-                rx.cond(
-                    State.grouped,
-                    "Variance explained by each node's parents within groups, after group "
-                    "means are removed (Bayesian R², 89% interval)",
-                    "Variance explained by each node's parents (Bayesian R², 89% interval)",
-                ),
+                rx.cond(State.grouped, b.R2_HEADING_GROUPED, b.R2_HEADING),
                 size="1", color=INK, padding_top="4px",
             ),
             rx.foreach(State.r2_rows, r2_row),

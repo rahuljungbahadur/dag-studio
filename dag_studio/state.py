@@ -17,6 +17,7 @@ import polars as pl
 import reflex as rx
 
 from . import backend as b
+from . import export
 
 # token -> {"df": pl.DataFrame, "model": PathModel, "evidence": {...}, "curves": {...}}
 _SESSIONS: dict[str, dict] = {}
@@ -212,6 +213,7 @@ class State(rx.State):
     progress_known: bool = False  # False: the task cannot say how far along it is
 
     # --- grouped (panel) data -----------------------------------------
+    data_kind: str = "file"  # "file", or "demo" for the built-in data (which has no file)
     all_columns: list[str] = []  # every column a group or time column could be
     group_cols: list[str] = []  # together they name a group, e.g. region and store; order is free
     time_col: str = ""
@@ -335,8 +337,8 @@ class State(rx.State):
                 key=v["key"],
                 x=v["x"],
                 y=v["y"],
-                given=f"given {', '.join(v['given'])}" if v["given"] else "with nothing held fixed",
-                stats=f"partial r = {v['r']:.2f} · p = {v['p']:.2g}",
+                given=b.violation_given(v["given"]),
+                stats=b.violation_stats(v["r"], v["p"]),
                 selected=v["key"] == self.selected_violation,
                 forward=f"Add {v['x']} → {v['y']}",
                 backward=f"Add {v['y']} → {v['x']}",
@@ -361,13 +363,7 @@ class State(rx.State):
                 colour = _AMBER
             else:
                 colour = _EDGE
-            arrow_char = "→" if e.directed else "—"
-            tooltip = f"{e.source} {arrow_char} {e.target}"
-            if term is not None:
-                tooltip += (
-                    f": direct coefficient {term.mean:.3f} "
-                    f"[{term.lower:.3f}, {term.upper:.3f}]"
-                )
+            tooltip = b.edge_tooltip(e.source, e.target, e.directed, term)
             views.append(
                 EdgeView(
                     id=e.key,
@@ -416,8 +412,10 @@ class State(rx.State):
         self._refresh(relayout=True)
 
     def _set_table(
-        self, df, notes: list[str], filename: str, target: str = "", extras=None
+        self, df, notes: list[str], filename: str, target: str = "", extras=None,
+        kind: str = "file",
     ) -> None:
+        self.data_kind = kind
         session = self._session()
         session["raw"], session["df"] = df, df  # df is replaced by a group-demeaned copy if grouped
         session["extras"] = extras if extras is not None else pl.DataFrame()
@@ -448,6 +446,10 @@ class State(rx.State):
     @rx.var
     def can_fit(self) -> bool:
         return self.n_rows > 0 and not self.problems and self.busy == ""
+
+    @rx.var
+    def can_export_code(self) -> bool:
+        return self.n_rows > 0 and not self.problems
 
     @rx.var
     def is_busy(self) -> bool:
@@ -795,7 +797,7 @@ class State(rx.State):
     @rx.event
     def load_demo(self):
         note = "Synthetic demo data with a known DAG."
-        self._set_table(b.demo_table(), [note], "demo data", target="revenue")
+        self._set_table(b.demo_table(), [note], "demo data", target="revenue", kind="demo")
 
     @rx.event
     def load_test_file(self):
@@ -1086,16 +1088,7 @@ class State(rx.State):
             self.validated_sig = sig
             self.verdict, self.verdict_detail = result.verdict, result.detail
             self.verdict_tone = result.tone
-            n = len(result.violations)
-            self.violation_summary = (
-                f"{n} of {result.n_tests} implied independences "
-                f"{'is' if n == 1 else 'are'} violated. At α = {alpha:g}, about "
-                f"{result.expected_by_chance:.1f} would be flagged by chance alone."
-            )
-            if result.n_collapsed:
-                self.violation_summary += (
-                    f" {result.n_collapsed} test(s) skipped: a conditioning variable was redundant."
-                )
+            self.violation_summary = b.validation_summary(result)
             self._violations = [
                 {"key": v.key, "x": v.x, "y": v.y, "given": v.given,
                  "r": v.partial_corr, "p": v.p_value}
@@ -1132,6 +1125,33 @@ class State(rx.State):
     @rx.event
     def tidy_layout(self):
         self._refresh(relayout=True)
+
+    def _export_script(self) -> str:
+        """The script that reproduces the current graph, settings and fit.
+
+        Raises a ValueError that says what to fix if the graph cannot be fitted yet.
+        """
+        edges = self._edge_objects()
+        plan = b.prepare_fit(
+            self._session()["df"], list(self.nodes), edges, self.target, dict(self.families),
+            {n: dict(v) for n, v in self.prior_text.items()}, self.grouped,
+        )
+        return export.build_script(
+            nodes=list(self.nodes), outcome=self.target, plan=plan, data_kind=self.data_kind,
+            data_file=self.filename, group_cols=list(self.group_cols), time_col=self.time_col,
+            alpha=float(self.alpha),
+        )
+
+    @rx.event
+    def export_code(self):
+        """Download a Python script that reproduces this analysis."""
+        try:
+            script = self._export_script()
+        except ValueError as exc:
+            self.error = f"Could not export the code: {exc}"
+            return
+        self.error = ""
+        return rx.download(data=script, filename="dag_studio_analysis.py")
 
     @rx.event
     def export_dot(self):
@@ -1186,23 +1206,13 @@ class State(rx.State):
         return State.show_selection
 
     def _set_quality(self, quality: "b.FitQuality", target: str) -> None:
-        nodes = sorted(quality.nodes, key=lambda n: (n.node != target, n.node))
         self.r2_rows = [
-            R2Row(
-                node=n.node,
-                family="" if n.family == "gaussian" else n.family,
-                r2=f"{n.r2:.2f}",
-                interval=f"[{n.lower:.2f}, {n.upper:.2f}]",
-                bar=f"{max(n.r2, 0) * 100:.0f}%",
-                is_target=n.node == target,
-            )
-            for n in nodes
+            R2Row(node=r.node, family=r.family, r2=r.r2, interval=r.interval, bar=r.bar,
+                  is_target=r.is_target)
+            for r in b.quality_rows(quality, target)
         ]
-        self._r2_text = {n.node: f"{n.r2:.2f} [{n.lower:.2f}, {n.upper:.2f}]" for n in nodes}
-        self.fit_diagnostics = (
-            f"{b.CHAINS} chains × {b.DRAWS} draws · largest r̂ {quality.max_rhat:.3f} · "
-            f"smallest ESS {quality.min_ess:.0f} · {quality.divergences} divergences"
-        )
+        self._r2_text = {n.node: b.r2_text(n) for n in quality.nodes}
+        self.fit_diagnostics = b.quality_diagnostics(quality, b.CHAINS, b.DRAWS)
         self.fit_warnings = quality.warnings()
         self.fit_trouble = not quality.max_rhat < b.RHAT_BAD or quality.divergences > 0
 

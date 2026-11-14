@@ -169,6 +169,33 @@ instruction.
    attributes and flagged items listed as comments. The file can be passed
    straight to `pathmc.dag_to_spec`, or imported back (step 2).
 
+   **Export code** downloads `dag_studio_analysis.py`, a script that reproduces
+   the analysis outside the app. It is enabled once every edge has a
+   direction. The script has, in order: the `pip install` line with the exact
+   package versions it was exported from; the settings (outcome, group
+   columns, MCMC settings, families, priors); the **DAG as a `digraph { ... }`**
+   string; and a short `main()` that loads the data the way the app did, runs
+   **Validate DAG**, fits with
+   `BuildModelFromDAG(..., style="native")` and `model.fit(...)` using the
+   app's draws, chains and seed, and then prints and saves what the app shows:
+   the data summary, validation, fit quality and R², every fitted equation, the
+   direct effects, and the effect curves E[child | do(parent)] for every edge
+   and E[outcome | do(node)] for every node. It writes
+   `dag_studio_output/` with `results.json` (every number), `effect_curves.csv`
+   and one `effect_*.html` plot per curve. The data file is not embedded: put
+   the file you loaded next to the script (the built-in demo data is generated
+   inside it). Set `RUN_VALIDATION` or `MAKE_PLOTS` to `False` to skip those
+   steps.
+
+   The functions that do the app's work (cleaning, grouping, equations, R²,
+   curves, validation) are copied into the bottom of the script from this
+   package's own source at export time, so there is one version of that code
+   and the script imports nothing from DAG Studio. Tests run the script in a
+   separate process and compare it with the app for ungrouped, grouped and
+   bernoulli fits. Sampling is seeded and the graph's edges are fitted in sorted
+   order in both, so the numbers agree to the precision the app displays. The
+   very first run after installing numba can differ in about the 8th decimal.
+
 After any structural edit, or a change of family or prior, the plot is hidden
 and the button reads **Refit model**, so a plot never describes a model that is
 no longer on screen.
@@ -216,6 +243,12 @@ drop zone too. Things to check:
   adding only `store` to see the repeated-label warning, and set `demand` to
   `bernoulli` to see it refused. After a fit the price → demand slope is
   about -0.67 (true -0.8; ungrouped it is about -0.22).
+- **Export code**: with the demo data loaded and a fitted graph, press **Export
+  code**, put `dag_studio_analysis.py` in an empty folder, install the packages
+  on its `pip install` line, and run `python dag_studio_analysis.py`. Its
+  numbers (equations, R², diagnostics) match the app's, and it writes
+  `dag_studio_output/`. For a file you loaded, copy that file into the folder
+  first.
 - **Import**: with the test file loaded, paste this into the box in step 2 and
   press **Import pasted DAG** (`2024 price index` is matched to
   `v_2024_price_index`):
