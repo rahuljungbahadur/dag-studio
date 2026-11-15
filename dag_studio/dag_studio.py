@@ -236,8 +236,8 @@ def data_step() -> rx.Component:
                  " variables", rx.cond(State.grouped, " (group means removed)", "")),
         ),
         rx.foreach(State.notes, lambda note: hint(note)),
-        grouping_controls(),
         demo_section(),
+        grouping_controls(),
         needs_data=False,
     )
 
