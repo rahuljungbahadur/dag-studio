@@ -69,6 +69,36 @@ def step(n: int, title: str, instruction: str, *body, needs_data: bool = True) -
     )
 
 
+def info(*paragraphs: str) -> rx.Component:
+    """An (i) that explains something on hover, in a card that wraps at a readable width.
+
+    (Radix's plain tooltip has no maximum width, so long text would run on in one line.)
+    """
+    return rx.hover_card.root(
+        rx.hover_card.trigger(rx.icon("info", size=15, color=MUTED, cursor="help")),
+        rx.hover_card.content(
+            rx.vstack(
+                *[rx.text(text, size="1", line_height="1.5", color=INK) for text in paragraphs],
+                spacing="2", align="stretch",
+            ),
+            side="right", size="1", max_width="300px",
+        ),
+    )
+
+
+GROUPING_INFO = (
+    "For panel data: rows that are repeated observations of the same thing, like a store, a "
+    "country or a person. Pick the column that names it. Skip this if your rows are "
+    "independent.",
+    "If one column is not enough, pick several: a store number used in every region needs the "
+    "region too. A group is one combination of the columns you pick, so the order makes no "
+    "difference.",
+    "Each group's mean is then removed from every variable, so only differences within a group "
+    "are compared. That stops group differences from creating false links, in discovery, "
+    "validation and the fit.",
+)
+
+
 def group_chip(column: str) -> rx.Component:
     return rx.badge(
         column, " ×", on_click=State.remove_group_col(column), cursor="pointer",
@@ -77,29 +107,20 @@ def group_chip(column: str) -> rx.Component:
 
 
 def grouping_controls() -> rx.Component:
-    """Say which columns identify a group (a store, a country…), for panel data."""
+    """A card for naming the columns that identify a group (a store, a country…), for panel data."""
     header = rx.hstack(
-        rx.text(rx.cond(State.grouping_open, "▾", "▸"), size="1", color=MUTED, width="10px"),
-        rx.text("Panel data: group the rows", size="1", weight="medium", color=INK),
-        rx.cond(State.grouped, rx.badge("on", color_scheme="blue", variant="soft", size="1")),
-        spacing="2", align="center", cursor="pointer", on_click=State.toggle_grouping,
+        rx.hstack(
+            rx.text(rx.cond(State.grouping_open, "▾", "▸"), size="1", color=MUTED, width="10px"),
+            rx.text("Group the rows", size="2", weight="medium", color=INK),
+            rx.cond(State.grouped, rx.badge("on", color_scheme="blue", variant="soft", size="1")),
+            spacing="2", align="center", cursor="pointer", on_click=State.toggle_grouping,
+        ),
+        info(*GROUPING_INFO),
+        spacing="2", align="center", width="100%",
     )
     controls = rx.vstack(
-        hint(
-            "Is each row one of many observations of the same thing, like a store, a country "
-            "or a person? Pick the column that names it. Skip this if your rows are "
-            "independent."
-        ),
-        hint(
-            "If one column is not enough, pick both: a store number used in every region needs "
-            "the region too. A group is one combination of the columns you pick, so the order "
-            "makes no difference."
-        ),
-        hint(
-            "Each group's mean is then removed from every variable, so only differences within "
-            "a group are compared. That stops group differences from creating false links, in "
-            "discovery, validation and the fit."
-        ),
+        hint("Do the rows belong to a store, a country or a person? Pick the column that "
+             "names it."),
         rx.cond(
             State.grouped,
             rx.hstack(
@@ -112,13 +133,16 @@ def grouping_controls() -> rx.Component:
             on_change=State.add_group_col, size="1",
         ),
         rx.hstack(
-            rx.text("Time column", size="1", color=MUTED),
+            rx.hstack(
+                rx.text("Time column", size="1", color=MUTED),
+                info("Optional. Kept out of the graph, and used to check the panel."),
+                spacing="2", align="center",
+            ),
             rx.spacer(),
             rx.select(State.time_options, value=State.time_value, on_change=State.set_time_col,
                       size="1"),
             width="100%", align="center",
         ),
-        hint("Optional: kept out of the graph, and used to check the panel."),
         rx.cond(
             State.group_error != "",
             rx.text(State.group_error, size="1", color=RED, line_height="1.5"),
@@ -128,7 +152,7 @@ def grouping_controls() -> rx.Component:
             rx.button("Clear grouping", on_click=State.clear_grouping, size="1", variant="ghost",
                       color_scheme="gray"),
         ),
-        spacing="2", width="100%", align="stretch", padding_top="4px",
+        spacing="2", width="100%", align="stretch",
     )
     return rx.cond(
         State.has_data,
@@ -147,7 +171,8 @@ def grouping_controls() -> rx.Component:
                 ),
             ),
             rx.cond(State.grouping_open, controls),
-            spacing="2", width="100%", align="stretch", padding_top="6px",
+            spacing="2", width="100%", align="stretch", padding="10px", background="white",
+            border=f"1px solid {LINE}", border_radius="8px",
         ),
     )
 
@@ -164,12 +189,13 @@ DEMO_PANEL_INFO = (
 )
 
 
-def demo_button(text: str, handler, info: str) -> rx.Component:
+def demo_button(text: str, handler, description: str) -> rx.Component:
     """A demo loader, with an (i) that explains the data on hover."""
+    info_icon = info(description)
     return rx.hstack(
         rx.button(text, on_click=handler, size="1", variant="soft", color_scheme="gray",
                   flex="1"),
-        rx.tooltip(rx.icon("info", size=15, color=MUTED, cursor="help"), content=info),
+        info_icon,
         spacing="2", align="center", width="100%",
     )
 

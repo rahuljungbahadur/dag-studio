@@ -63,8 +63,9 @@ instruction.
    and constant columns are ignored, and rows with missing values are dropped.
    The left panel lists exactly what was changed.
 
-   **Panel data?** *Panel data: group the rows* is open as soon as a file is
-   loaded. If each row is one of many observations of the same thing (a store,
+   **Panel data?** The *Group the rows* card is open as soon as a file is
+   loaded (hover its (i) for the explanation, so the panel stays short). If
+   each row is one of many observations of the same thing (a store,
    a country, a person), pick the column that names it; if your rows are
    independent, skip it. If one column is not enough, pick several, for example
    `region` and `store`. Text columns and ID columns are both offered. A group
@@ -249,7 +250,7 @@ Things to check, with the test file uploaded:
   `store`, `week` panel: 3 regions x 4 stores x 20 weeks, store names repeating
   across regions). First **Discover DAG** with no grouping: the graph is wrong (an
   edge reversed, `footfall` linked to `price`, `price → revenue` missing).
-  In *Panel data*, add `region` and `store`, and set the time column to
+  In the *Group the rows* card, add `region` and `store`, and set the time column to
   `week`. The summary reads "12 groups (region × store), 20 rows each,
   balanced, 20 periods"; `store_size` and `region_income` are removed with an
   explanation. Discover again: exactly `price → demand`, `promo → demand`,
