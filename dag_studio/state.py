@@ -115,7 +115,7 @@ _SYMBOLS = {"mu": "μ", "sigma": "σ", "alpha": "α", "beta": "β"}
 
 
 # Graph colours (kept in step with dag_studio.py).
-_ACCENT, _AMBER, _EDGE = "#2563eb", "#d97706", "#9aa5b1"
+_ACCENT, _AMBER, _EDGE = "#2563eb", "#a84f09", "#9aa5b1"
 
 
 async def _follow(state, task: "asyncio.Task", progress: b.Progress) -> None:

@@ -55,6 +55,10 @@ the (i) beside each for what is in it and the DAG it was built from.
 
 ## Using it
 
+The page is one screen tall: the header (progress bar, error messages) always
+stays in view, and the left panel, the graph and the right panel each scroll on
+their own. Longer explanations are behind the (i) icons: hover them.
+
 The left panel walks through these steps in order. Each step is numbered,
 shows ✓ once done, and the current one is highlighted with a one-line
 instruction.

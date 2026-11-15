@@ -8,13 +8,13 @@ from . import backend as b
 from .state import EdgeView, EquationRow, NodeView, PriorRow, R2Row, State, ViolationView
 
 INK = "#1f2933"
-MUTED = "#7b8794"
+MUTED = "#5f6b7a"  # 4.7:1 or better on white and on every tint it sits on
 LINE = "#e4e7eb"
 EDGE = "#9aa5b1"
 ACCENT = "#2563eb"
-AMBER = "#d97706"
+AMBER = "#a84f09"  # warnings: 4.9:1 or better
 VIOLET = "#7c3aed"  # validation hints
-GREEN = "#15803d"
+GREEN = "#157a39"
 GREEN_SOFT = "#dcfce7"
 RED = "#b42318"
 MONO = "ui-monospace, SFMono-Regular, Menlo, monospace"
@@ -42,8 +42,13 @@ def hint(*children, **props) -> rx.Component:
 # --------------------------------------------------------------------------
 
 
-def step(n: int, title: str, instruction: str, *body, needs_data: bool = True) -> rx.Component:
-    """A numbered step: ✓ when done, highlighted when it is the current one."""
+def step(
+    n: int, title: str, instruction: str, *body, needs_data: bool = True, more: tuple = ()
+) -> rx.Component:
+    """A numbered step: ✓ when done, highlighted when it is the current one.
+
+    ``instruction`` is one short line; ``more`` is the longer explanation, shown on hover.
+    """
     done = State.current_step > n
     current = State.current_step == n
     badge = rx.center(
@@ -59,6 +64,7 @@ def step(n: int, title: str, instruction: str, *body, needs_data: bool = True) -
         rx.hstack(
             badge,
             rx.text(title, size="2", weight="medium", color=rx.cond(current | done, INK, MUTED)),
+            info(*more) if more else rx.fragment(),
             spacing="2", align="center",
         ),
         hint(instruction, color=rx.cond(current, INK, MUTED)),
@@ -69,7 +75,7 @@ def step(n: int, title: str, instruction: str, *body, needs_data: bool = True) -
     )
 
 
-def info(*paragraphs: str) -> rx.Component:
+def info(*paragraphs: str, side: str = "right") -> rx.Component:
     """An (i) that explains something on hover, in a card that wraps at a readable width.
 
     (Radix's plain tooltip has no maximum width, so long text would run on in one line.)
@@ -81,7 +87,7 @@ def info(*paragraphs: str) -> rx.Component:
                 *[rx.text(text, size="1", line_height="1.5", color=INK) for text in paragraphs],
                 spacing="2", align="stretch",
             ),
-            side="right", size="1", max_width="300px",
+            side=side, size="1", max_width="300px",
         ),
     )
 
@@ -286,23 +292,25 @@ def import_controls() -> rx.Component:
 def discover_step() -> rx.Component:
     return step(
         2, "Discover or import",
-        "Pick the outcome you care about, then let TBFPC propose a graph, or import one you "
-        "already have. Either replaces the current edges.",
+        "Pick the outcome, then discover a graph or import one.",
         rx.select(State.columns, value=State.target, on_change=State.set_target, size="1"),
         rx.button(
             "Discover DAG", on_click=State.discover, disabled=State.is_busy,
             size="1", variant="solid", color_scheme="gray", high_contrast=True,
         ),
         import_controls(),
+        more=(
+            "TBFPC proposes a graph from the data, searching for what drives the outcome you "
+            "picked. Or import a graph you already have.",
+            "Either one replaces the current edges.",
+        ),
     )
 
 
 def edit_step() -> rx.Component:
     return step(
         3, "Review and edit",
-        "Use what you know about the domain: give every dashed edge a direction, and add, "
-        "reverse or delete edges. To add one, ⌘-click two nodes in the graph, then press Add "
-        "edge. Click a node to describe it or set its model.",
+        "Orient dashed edges, then add, reverse or delete edges.",
         rx.foreach(State.problems, lambda p: hint("• ", p, color=AMBER)),
         rx.cond(
             State.removed.length() > 0,
@@ -337,6 +345,13 @@ def edit_step() -> rx.Component:
                 spacing="1", width="100%",
             ),
         ),
+        more=(
+            "Use what you know about the domain: give every dashed edge a direction, and add, "
+            "reverse or delete edges.",
+            "To add an edge, ⌘-click two nodes in the graph (Ctrl-click on Windows), then press "
+            "Add edge above the graph.",
+            "Click a single node to describe it or set its model.",
+        ),
     )
 
 
@@ -366,21 +381,24 @@ def violation_list() -> rx.Component:
     """The violated pairs, collapsed until the header is clicked."""
     return rx.vstack(
         rx.hstack(
-            rx.text(rx.cond(State.violations_open, "▾", "▸"), size="1", color=MUTED,
-                    width="10px"),
-            rx.text(State.violations_header, size="1", weight="medium", color=INK),
-            spacing="2", align="center", cursor="pointer", width="100%",
-            on_click=State.toggle_violations,
+            rx.hstack(
+                rx.text(rx.cond(State.violations_open, "▾", "▸"), size="1", color=MUTED,
+                        width="10px"),
+                rx.text(State.violations_header, size="1", weight="medium", color=INK),
+                spacing="2", align="center", cursor="pointer", on_click=State.toggle_violations,
+            ),
+            info(
+                "Click a pair to see it on the graph.",
+                "Add an edge only if it makes sense in your domain: some violations are chance, "
+                "and a link can also come from a missing common cause.",
+                "A pair leaves this list once you connect it.",
+            ),
+            spacing="2", align="center", width="100%",
         ),
         rx.cond(
             State.violations_open,
             rx.vstack(
                 rx.foreach(State.violation_views, violation_row),
-                hint(
-                    "Click a pair to see it on the graph. Add an edge only if it makes sense in "
-                    "your domain: some violations are chance, and a link can also come from a "
-                    "missing common cause. A pair leaves this list once you connect it."
-                ),
                 spacing="2", width="100%", align="stretch",
             ),
         ),
@@ -392,8 +410,7 @@ def validate_step() -> rx.Component:
     tone = rx.match(State.verdict_tone, ("good", GREEN), ("bad", RED), INK)
     return step(
         4, "Validate",
-        "Check the graph against the data. A violation is a pair the graph says are "
-        "unrelated, but the data link. No model fit is needed.",
+        "Check the graph against the data.",
         rx.hstack(
             rx.button("Validate DAG", on_click=State.validate, disabled=~State.can_validate,
                       size="1", variant="solid", color_scheme="gray", high_contrast=True),
@@ -426,6 +443,10 @@ def validate_step() -> rx.Component:
                 spacing="2", width="100%", align="stretch",
             ),
         ),
+        more=(
+            "A violation is a pair the graph says is unrelated, but the data link.",
+            "No model fit is needed.",
+        ),
     )
 
 
@@ -452,17 +473,16 @@ def fit_step() -> rx.Component:
                 "Export code", on_click=State.export_code, disabled=~State.can_export_code,
                 size="1", variant="ghost", color_scheme="gray",
             ),
-            spacing="3",
-        ),
-        hint(
-            "Export code downloads a Python script for the DAG the model was last fitted on: "
-            "it loads your data from a path you set, loads the DAG as a digraph, and fits "
-            "it with the same settings and seed."
+            info(
+                "Export code downloads a Python script for the DAG the model was last fitted "
+                "on. It loads your data from a path you set, loads the DAG as a digraph, and "
+                "fits it with the same settings and seed.",
+            ),
+            spacing="3", align="center",
         ),
         rx.cond(
             State.can_export_code & State.stale,
-            hint("The graph changed since the last fit. Export code uses the graph that was "
-                 "fitted, not these edits.", color=AMBER),
+            hint("Edited since the fit: Export code uses the fitted graph.", color=AMBER),
         ),
         rx.cond(
             ~State.can_export_code,
@@ -633,9 +653,12 @@ def cycle_note() -> rx.Component:
 def centre_panel() -> rx.Component:
     return rx.vstack(
         rx.hstack(
-            hint(
+            hint("Click a node or an edge to inspect it."),
+            info(
                 "Click a node to highlight its connections and describe it, or an edge to "
-                "inspect it. Dashed edges have no direction yet."
+                "inspect it.",
+                "Dashed edges have no direction yet.",
+                side="bottom",
             ),
             rx.spacer(),
             rx.button("Tidy layout", on_click=State.tidy_layout, size="1", variant="ghost",
@@ -685,7 +708,15 @@ def prior_row(row: PriorRow) -> rx.Component:
 
 def node_model_section() -> rx.Component:
     return rx.vstack(
-        label("Model for this node"),
+        rx.hstack(
+            label("Model for this node"),
+            info(
+                "Empty boxes use pathmc's default (shown in grey).",
+                "The coefficient prior covers the intercept and every parent's slope.",
+                "Changes apply at the next fit.",
+            ),
+            spacing="2", align="center",
+        ),
         rx.cond(
             State.picked_has_parents,
             rx.vstack(
@@ -697,17 +728,10 @@ def node_model_section() -> rx.Component:
                     width="100%", align="center",
                 ),
                 rx.foreach(State.picked_prior_rows, prior_row),
-                hint(
-                    "Empty boxes use pathmc's default (shown in grey). The coefficient prior "
-                    "covers the intercept and every parent's slope. Changes apply at the next fit."
-                ),
                 small_button("Reset priors to defaults", State.reset_priors, variant="ghost"),
                 spacing="2", width="100%", align="stretch",
             ),
-            hint(
-                "This node has no incoming edges, so it has no equation of its own: family "
-                "and priors only apply to nodes with parents."
-            ),
+            hint("No incoming edges, so no equation: family and priors need a parent."),
         ),
         spacing="2", width="100%", align="stretch", padding_top="8px",
     )
@@ -870,7 +894,17 @@ def fit_quality_section() -> rx.Component:
     return rx.cond(
         State.shows_effects,
         rx.vstack(
-            label("Fit quality"),
+            rx.hstack(
+                label("Fit quality"),
+                info(
+                    "R² says how well the parents predict a node, not whether the graph is "
+                    "causally right.",
+                    "A well-identified effect can sit in a noisy outcome, and a wrong graph can "
+                    "predict well. Use Validate DAG for the graph.",
+                    side="left",
+                ),
+                spacing="2", align="center",
+            ),
             hint(State.fit_diagnostics),
             rx.cond(
                 State.fit_warnings.length() > 0,
@@ -886,11 +920,6 @@ def fit_quality_section() -> rx.Component:
                 size="1", color=INK, padding_top="4px",
             ),
             rx.foreach(State.r2_rows, r2_row),
-            hint(
-                "R² says how well the parents predict a node, not whether the graph is causally "
-                "right: a well-identified effect can sit in a noisy outcome, and a wrong graph "
-                "can predict well. Use Validate DAG for the graph."
-            ),
             spacing="2", width="100%", align="stretch",
         ),
     )
@@ -965,21 +994,35 @@ def status_bar() -> rx.Component:
                 rx.hstack(rx.spinner(size="1"), hint(State.busy), spacing="2", align="center"),
             ),
         ),
-        rx.cond(State.error != "", rx.text(State.error, size="1", color=RED)),
-        width="100%", align="center", spacing="3",
+        rx.cond(
+            State.error != "",
+            # Wraps inside half the header, so a long message grows the header instead of
+            # running off the screen.
+            rx.text(State.error, size="1", color=RED, line_height="1.4", max_width="50%",
+                    style={"overflowWrap": "anywhere"}),
+        ),
+        width="100%", align="center", spacing="3", flex_shrink="0",
         padding_bottom="12px", border_bottom=f"1px solid {LINE}",
     )
 
 
+def pane(*children) -> rx.Component:
+    """One of the three columns. It scrolls on its own, so the header and the other two stay put."""
+    return rx.box(*children, height="100%", min_height="0", overflow_y="auto", padding_right="6px")
+
+
 def index() -> rx.Component:
+    # The page is exactly one screen tall: the header (progress, errors) is always in view, and
+    # the left panel, the graph and the right panel each scroll without moving the others.
     return rx.box(
         status_bar(),
         rx.grid(
-            left_panel(), centre_panel(), right_panel(),
-            columns="250px minmax(0, 1fr) 390px", gap="28px", width="100%", padding_top="18px",
-            align_items="start",
+            pane(left_panel()), pane(centre_panel()), pane(right_panel()),
+            columns="250px minmax(0, 1fr) 390px", rows="minmax(0, 1fr)", gap="28px",
+            width="100%", flex="1", min_height="0", padding_top="18px",
         ),
-        max_width="1500px", margin="0 auto", padding="18px 24px",
+        max_width="1500px", margin="0 auto", padding="18px 24px", height="100vh",
+        display="flex", flex_direction="column", overflow="hidden",
     )
 
 
