@@ -262,8 +262,10 @@ def test_state_records_what_a_fit_used(tmp_path):
         async def __aexit__(self, *exc):
             return False
 
+    st.editing = True  # the user had pressed Edit DAG to change the graph before refitting
     asyncio.run(State.fit.fn(Proxy(st)))
     assert st.fitted and st.error == ""
+    assert st.editing is False and st.locked is True  # a new fit locks the DAG and priors again
     snap = st.fit_snapshot
     assert snap["outcome"] == "revenue" and snap["data_kind"] == "demo"
     assert snap["pairs"] == sorted([e.source, e.target] for e in DEMO_EDGES)

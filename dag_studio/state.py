@@ -114,6 +114,10 @@ class PriorRow:
 _SYMBOLS = {"mu": "μ", "sigma": "σ", "alpha": "α", "beta": "β"}
 
 
+LOCKED_MESSAGE = (
+    "The DAG and priors are locked after fitting. Click Edit DAG above the graph to change them."
+)
+
 # Graph colours (kept in step with dag_studio.py).
 _ACCENT, _AMBER, _EDGE = "#2563eb", "#a84f09", "#9aa5b1"
 
@@ -189,6 +193,7 @@ class State(rx.State):
 
     # --- model --------------------------------------------------------
     fit_snapshot: dict = {}  # what the last fit used (see backend.fit_snapshot); {} if none
+    editing: bool = False  # after a fit the DAG and priors are locked until "Edit DAG" is pressed
     fitted: bool = False
     stale: bool = False  # graph edited since the last fit
     r2_rows: list[R2Row] = []
@@ -244,6 +249,13 @@ class State(rx.State):
         self.progress_label = label
         self.progress_known = fraction is not None
         self.progress_pct = 0 if fraction is None else int(round(fraction * 100))
+
+    def _locked_out(self) -> bool:
+        """Refuse an edit of the DAG or priors while the fitted model is locked."""
+        if self.fitted and not self.editing:
+            self.error = LOCKED_MESSAGE
+            return True
+        return False
 
     def _graph_sig(self) -> str:
         edges = sorted(
@@ -406,7 +418,7 @@ class State(rx.State):
         self.verdict = self.verdict_detail = self.violation_summary = ""
         self.selected_nodes, self.selected_edge = [], ""
         self.fitted = self.stale = self.has_curve = self.has_equation = False
-        self.fit_snapshot = {}
+        self.fit_snapshot, self.editing = {}, False
         self.curve_caption = self.equation_caption = self.evidence_caption = ""
         session = self._session()
         session.pop("model", None)
@@ -448,6 +460,11 @@ class State(rx.State):
     @rx.var
     def can_fit(self) -> bool:
         return self.n_rows > 0 and not self.problems and self.busy == ""
+
+    @rx.var
+    def locked(self) -> bool:
+        """The model is fitted, so the DAG and priors cannot change until Edit DAG is pressed."""
+        return self.fitted and not self.editing
 
     @rx.var
     def can_export_code(self) -> bool:
@@ -669,7 +686,7 @@ class State(rx.State):
         session["curves"] = {}
         self.selected_nodes, self.selected_edge, self.refused_cycle = [], "", []
         self.fitted = self.stale = self.has_curve = self.has_equation = False
-        self.fit_snapshot = {}
+        self.fit_snapshot, self.editing = {}, False
         self.evidence_caption = ""
         self._violations, self.validated_sig, self.selected_violation = [], "", ""
         self.verdict = self.verdict_detail = self.violation_summary = ""
@@ -727,6 +744,17 @@ class State(rx.State):
         return True
 
     @rx.event
+    def start_editing(self):
+        """Unlock the DAG and priors of a fitted model. The first change marks the fit stale."""
+        self.editing = True
+        self.error = ""
+
+    @rx.event
+    def stop_editing(self):
+        """Lock them again, without refitting."""
+        self.editing = False
+
+    @rx.event
     def toggle_grouping(self):
         self.grouping_open = not self.grouping_open
 
@@ -750,6 +778,9 @@ class State(rx.State):
 
     def _import_text(self, text: str) -> None:
         self.import_ok, self.import_notes = False, []
+        if self._locked_out():
+            self.import_message = LOCKED_MESSAGE
+            return
         if not self.n_rows:
             self.import_message = "Load data first: the graph's nodes are the dataset's columns."
             return
@@ -822,7 +853,7 @@ class State(rx.State):
     @rx.event(background=True)
     async def discover(self):
         async with self:
-            if self.busy or not self.n_rows:
+            if self.busy or not self.n_rows or self._locked_out():
                 return
             if self.target not in self.nodes:
                 self.error = f"The outcome '{self.target}' was removed. Restore it first."
@@ -849,7 +880,7 @@ class State(rx.State):
             self.flagged_edges, self.refused_cycle = [], []
             self.selected_nodes, self.selected_edge = [], ""
             self.fitted = self.stale = self.has_curve = self.has_equation = False
-            self.fit_snapshot = {}
+            self.fit_snapshot, self.editing = {}, False
             self.evidence_caption = ""
             self._refresh(relayout=True)
             self.busy = self.progress_label = ""
@@ -860,6 +891,8 @@ class State(rx.State):
 
     def _put_edge(self, source: str, target: str) -> None:
         """Set the edge between a pair to ``source -> target``."""
+        if self._locked_out():
+            return
         key = b.edge_key(source, target)
         self.refused_cycle = []
         others = [e for e in self.edges if b.edge_key(e["source"], e["target"]) != key]
@@ -924,6 +957,8 @@ class State(rx.State):
 
     @rx.event
     def delete_edge(self):
+        if self._locked_out():
+            return
         key = self.selected_edge
         self.edges = [e for e in self.edges if b.edge_key(e["source"], e["target"]) != key]
         self.flagged_edges = [k for k in self.flagged_edges if k != key]
@@ -992,7 +1027,7 @@ class State(rx.State):
     def set_family(self, family: str):
         """Set the selected node's family. Applies at the next fit."""
         node = self.picked
-        if not node or family not in b.FAMILIES:
+        if not node or family not in b.FAMILIES or self._locked_out():
             return
         families = dict(self.families)
         if family == "gaussian":
@@ -1009,7 +1044,7 @@ class State(rx.State):
     def set_prior(self, key: str, text: str):
         """Store one typed prior number for the selected node (blank = default)."""
         node = self.picked
-        if not node:
+        if not node or self._locked_out():
             return
         typed = dict(self.prior_text.get(node, {}))
         if text.strip():
@@ -1026,6 +1061,8 @@ class State(rx.State):
 
     @rx.event
     def reset_priors(self):
+        if self._locked_out():
+            return
         if self.picked in self.prior_text:
             self.prior_text = {n: v for n, v in self.prior_text.items() if n != self.picked}
             self._graph_changed()
@@ -1034,7 +1071,7 @@ class State(rx.State):
     @rx.event
     def remove_node(self):
         node = self.picked
-        if not node:
+        if not node or self._locked_out():
             return
         self.nodes = [n for n in self.nodes if n != node]
         self.removed = sorted(self.removed + [node])
@@ -1052,6 +1089,8 @@ class State(rx.State):
 
     @rx.event
     def restore_node(self, node: str):
+        if self._locked_out():
+            return
         if node in self.removed:
             self.removed = [n for n in self.removed if n != node]
             self.nodes = self.nodes + [node]
@@ -1189,6 +1228,7 @@ class State(rx.State):
             session["model"], session["curves"] = fit.model, {}
             session["equations"] = equations
             self.fitted, self.stale = True, False
+            self.editing = False  # a new fit locks the DAG and priors it used
             self.fit_snapshot = b.fit_snapshot(fit.plan, target, *where)
             self.busy = self.progress_label = ""
             self._set_quality(quality, target)

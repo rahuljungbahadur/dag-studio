@@ -207,6 +207,18 @@ instruction.
    precision the app shows; the very first run after installing numba can
    differ in about the 8th decimal.
 
+**Once a model is fitted, the DAG and the priors are locked.** The bar above
+the graph says so and has an **Edit DAG** button, with an (i) that explains
+why. While locked, every control that changes the graph, the families or the
+priors is hidden (add, reverse, orient and delete edges, remove and restore
+nodes, the node's family and priors, Discover, Import, and the suggested edges
+from Validate), and the app refuses those changes even if one reached it
+another way. Press **Edit DAG** to unlock them; the bar then says "Editing the
+DAG" and offers **Done editing** to lock them again without refitting. Fitting
+again locks them. Descriptions, review flags, selecting nodes and edges, and
+Tidy layout are never locked, because they do not change the model. Changing the
+data or its grouping discards the fit, and so the lock.
+
 After any structural edit, or a change of family or prior, the plot is hidden
 and the button reads **Refit model**, so a plot never describes a model that is
 no longer on screen.

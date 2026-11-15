@@ -255,7 +255,7 @@ def edge_pairs(st: State) -> set[tuple[str, str, bool]]:
 def test_importing_replaces_the_edges_and_resets_what_depended_on_them():
     st = data_state()
     st.edges = [{"source": "a", "target": "b", "directed": True}]
-    st.fitted, st.validated_sig, st.n_found = True, "old", 2
+    st.fitted, st.editing, st.validated_sig, st.n_found = True, True, "old", 2  # editing: Edit DAG pressed
     st._violations = [{"key": "a~c", "x": "a", "y": "c", "given": [], "r": 0.3, "p": 0.01}]
     st._session()["model"] = object()
     st.paste_text = "c ~ a + b"
@@ -411,7 +411,7 @@ def test_grouped_wording_reaches_the_numbers():
     st.selected_nodes = ["demand"]
     assert st.picked_r2.endswith("within groups")
     # A non-Gaussian family on grouped data is refused straight away.
-    st.selected_nodes = ["demand"]
+    st.selected_nodes, st.editing = ["demand"], True  # Edit DAG pressed, so the lock is off
     State.set_family.fn(st, "bernoulli")
     assert "once group means are removed" in st.error
 
@@ -470,3 +470,152 @@ def test_the_demo_buttons_load_generated_data_with_no_file():
 def test_the_test_files_are_no_longer_offered_in_the_app():
     for name in ("load_test_file", "load_panel_test_file"):
         assert not hasattr(State, name)
+
+
+
+# --------------------------------------------------------------------------
+# Locking the DAG and priors after a fit
+# --------------------------------------------------------------------------
+
+from dag_studio.state import LOCKED_MESSAGE  # noqa: E402
+
+
+class Proxy:
+    """Stands in for the StateProxy a background handler runs on."""
+
+    def __init__(self, state):
+        object.__setattr__(self, "_state", state)
+
+    def __getattr__(self, name):
+        return getattr(self._state, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._state, name, value)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def fitted_state() -> State:
+    """The demo data with a graph, one node removed, and a model that has been fitted."""
+    st = State(_reflex_internal_init=True)
+    State.load_demo.fn(st)
+    st.edges = [
+        {"source": s, "target": t, "directed": True}
+        for s, t in [("season", "promo"), ("promo", "demand"), ("price", "demand"),
+                     ("demand", "revenue")]
+    ]
+    st._refresh()
+    st.selected_nodes = ["noise"]
+    State.remove_node.fn(st)  # still unlocked: nothing is fitted yet
+    st.selected_nodes = []
+    st.fitted, st.stale = True, False
+    return st
+
+
+def graph_and_priors(st: State):
+    return (list(st.edges), list(st.nodes), list(st.removed), dict(st.families),
+            dict(st.prior_text))
+
+
+def test_the_dag_and_priors_are_unlocked_until_a_model_is_fitted():
+    st = State(_reflex_internal_init=True)
+    State.load_demo.fn(st)
+    assert st.locked is False
+    st.fitted = True
+    assert st.locked is True  # fitted, and Edit DAG not pressed
+    State.start_editing.fn(st)
+    assert st.locked is False
+    State.stop_editing.fn(st)
+    assert st.locked is True
+
+
+def test_every_change_to_the_dag_or_priors_is_refused_while_locked():
+    attempts = {
+        "add edge": lambda st: (setattr(st, "selected_nodes", ["season", "revenue"]),
+                                State.add_selected_edge.fn(st)),
+        "add suggested edge": lambda st: State.add_violation_edge.fn(st, "season", "price"),
+        "reverse": lambda st: (setattr(st, "selected_edge", "demand~revenue"),
+                               State.reverse_edge.fn(st)),
+        "orient": lambda st: (setattr(st, "selected_edge", "demand~revenue"),
+                              State.orient_edge.fn(st)),
+        "delete edge": lambda st: (setattr(st, "selected_edge", "demand~revenue"),
+                                   State.delete_edge.fn(st)),
+        "remove node": lambda st: (setattr(st, "selected_nodes", ["price"]),
+                                   State.remove_node.fn(st)),
+        "restore node": lambda st: State.restore_node.fn(st, "noise"),
+        "set family": lambda st: (setattr(st, "selected_nodes", ["revenue"]),
+                                  State.set_family.fn(st, "studentt")),
+        "set prior": lambda st: (setattr(st, "selected_nodes", ["revenue"]),
+                                 State.set_prior.fn(st, "beta.sigma", "3")),
+    }
+    for name, attempt in attempts.items():
+        st = fitted_state()
+        before = graph_and_priors(st)
+        attempt(st)
+        assert graph_and_priors(st) == before, name
+        assert st.error == LOCKED_MESSAGE, name
+        assert st.fitted and not st.stale, name  # the fit is untouched
+
+    st = fitted_state()
+    st.prior_text = {"revenue": {"beta.sigma": "3"}}
+    st.selected_nodes = ["revenue"]
+    State.reset_priors.fn(st)
+    assert st.prior_text == {"revenue": {"beta.sigma": "3"}} and st.error == LOCKED_MESSAGE
+
+
+def test_importing_and_discovering_are_refused_while_locked():
+    import asyncio
+
+    st = fitted_state()
+    before = graph_and_priors(st)
+    st.paste_text = "revenue ~ price"
+    State.import_pasted.fn(st)
+    assert graph_and_priors(st) == before and st.import_message == LOCKED_MESSAGE
+    assert st.paste_text == "revenue ~ price"  # kept, so nothing is lost
+    asyncio.run(State.discover.fn(Proxy(st)))
+    assert graph_and_priors(st) == before and st.error == LOCKED_MESSAGE and st.busy == ""
+
+
+def test_descriptions_flags_selection_and_layout_are_never_locked():
+    st = fitted_state()
+    click(st, "demand")
+    assert st.picked == "demand"
+    State.set_description.fn(st, "units sold")
+    assert st.descriptions["demand"] == "units sold"
+    State.toggle_flag_node.fn(st)
+    assert st.flagged_nodes == ["demand"]
+    State.select_edge.fn(st, "demand~revenue")
+    State.toggle_flag_edge.fn(st)
+    assert st.flagged_edges == ["demand~revenue"]
+    State.tidy_layout.fn(st)
+    State.set_target.fn(st, "demand")
+    assert st.error == "" and st.fitted and not st.stale  # none of it touched the fit
+
+
+def test_edit_dag_unlocks_the_first_change_marks_the_fit_stale_and_done_relocks():
+    st = fitted_state()
+    State.start_editing.fn(st)
+    st.selected_nodes = ["season", "revenue"]
+    State.add_selected_edge.fn(st)
+    assert any((e["source"], e["target"]) == ("season", "revenue") for e in st.edges)
+    assert st.stale and st.fitted and st.error == ""  # the fit is now out of date
+    State.stop_editing.fn(st)
+    edges = list(st.edges)
+    st.selected_edge = "season~revenue"
+    State.delete_edge.fn(st)
+    assert st.edges == edges and st.error == LOCKED_MESSAGE  # locked again, stale or not
+
+
+def test_the_lock_ends_when_the_fit_it_protects_is_discarded():
+    for discard in (lambda st: st._discard_results(), lambda st: st._reset_graph()):
+        st = fitted_state()
+        st.editing = True
+        discard(st)
+        assert st.fitted is False and st.editing is False and st.locked is False
+    st = fitted_state()  # a different graph or new data means there is no fit to protect
+    State.load_demo.fn(st)
+    assert st.locked is False

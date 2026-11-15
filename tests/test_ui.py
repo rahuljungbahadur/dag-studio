@@ -78,3 +78,11 @@ def test_long_explanations_live_in_hover_cards_not_inline():
 def test_the_explanations_are_there_to_hover():
     rendered = str(page.index().render())
     assert rendered.count("HoverCard") >= 8  # steps 2-4, grouping, time, demos, export, ...
+
+
+def test_the_lock_bar_offers_edit_dag_and_explains_itself():
+    rendered = str(page.index().render())
+    assert "Edit DAG" in rendered and "Done editing" in rendered
+    assert "DAG and priors locked" in rendered and "Editing the DAG" in rendered
+    assert "After fitting, the DAG and the priors are locked" in rendered  # in the (i) hover
+    assert page.LOCKED_NOTE in rendered  # why the controls are missing

@@ -294,11 +294,18 @@ def discover_step() -> rx.Component:
         2, "Discover or import",
         "Pick the outcome, then discover a graph or import one.",
         rx.select(State.columns, value=State.target, on_change=State.set_target, size="1"),
-        rx.button(
-            "Discover DAG", on_click=State.discover, disabled=State.is_busy,
-            size="1", variant="solid", color_scheme="gray", high_contrast=True,
+        rx.cond(
+            State.locked,
+            hint(LOCKED_NOTE),
+            rx.vstack(
+                rx.button(
+                    "Discover DAG", on_click=State.discover, disabled=State.is_busy,
+                    size="1", variant="solid", color_scheme="gray", high_contrast=True,
+                ),
+                import_controls(),
+                spacing="2", width="100%", align="stretch",
+            ),
         ),
-        import_controls(),
         more=(
             "TBFPC proposes a graph from the data, searching for what drives the outcome you "
             "picked. Or import a graph you already have.",
@@ -313,7 +320,7 @@ def edit_step() -> rx.Component:
         "Orient dashed edges, then add, reverse or delete edges.",
         rx.foreach(State.problems, lambda p: hint("• ", p, color=AMBER)),
         rx.cond(
-            State.removed.length() > 0,
+            (State.removed.length() > 0) & ~State.locked,
             rx.vstack(
                 label("Removed nodes"),
                 rx.flex(
@@ -361,7 +368,7 @@ def violation_row(v: ViolationView) -> rx.Component:
         hint(v.given),
         hint(v.stats),
         rx.cond(
-            v.selected,
+            v.selected & ~State.locked,
             rx.flex(
                 rx.button(v.forward, size="1", variant="soft", color_scheme="violet",
                           on_click=State.add_violation_edge(v.x, v.y).stop_propagation),
@@ -619,6 +626,41 @@ def graph_canvas() -> rx.Component:
     )
 
 
+LOCK_INFO = (
+    "After fitting, the DAG and the priors are locked, so what you see keeps matching the fitted "
+    "model.",
+    "Edit DAG unlocks them. As soon as you change something the fit is marked out of date, and "
+    "Refit model fits the new graph. Done editing locks them again.",
+    "Descriptions and review flags are never locked.",
+)
+LOCKED_NOTE = "Locked after fitting. Click Edit DAG above the graph to change this."
+
+
+def lock_bar() -> rx.Component:
+    """Once a model is fitted: say the DAG is locked, and offer the one way to unlock it."""
+    return rx.cond(
+        State.fitted,
+        rx.hstack(
+            rx.text(
+                rx.cond(State.locked, "🔒 DAG and priors locked", "✎ Editing the DAG"),
+                size="2", weight="medium", color=INK,
+            ),
+            rx.spacer(),
+            rx.cond(
+                State.locked,
+                rx.button("Edit DAG", on_click=State.start_editing, size="2", variant="solid",
+                          color_scheme="blue"),
+                rx.button("Done editing", on_click=State.stop_editing, size="2", variant="soft",
+                          color_scheme="gray"),
+            ),
+            info(*LOCK_INFO, side="bottom"),
+            width="100%", align="center", spacing="3", padding="8px 12px", border_radius="8px",
+            border=rx.cond(State.locked, "1px solid #dbe4ff", "1px solid #f3d9a8"),
+            background=rx.cond(State.locked, "#f5f8ff", "#fff8eb"),
+        ),
+    )
+
+
 def edge_toolbar() -> rx.Component:
     """Add an edge between the two nodes selected with ⌘-click."""
     return rx.hstack(
@@ -652,6 +694,7 @@ def cycle_note() -> rx.Component:
 
 def centre_panel() -> rx.Component:
     return rx.vstack(
+        lock_bar(),
         rx.hstack(
             hint("Click a node or an edge to inspect it."),
             info(
@@ -665,7 +708,7 @@ def centre_panel() -> rx.Component:
                       color_scheme="gray"),
             width="100%", align="center",
         ),
-        rx.cond(State.has_data, edge_toolbar()),
+        rx.cond(State.has_data & ~State.locked, edge_toolbar()),
         cycle_note(),
         effect_legend(),
         rx.cond(
@@ -777,11 +820,12 @@ def node_details() -> rx.Component:
             size="1", rows="4", resize="vertical", width="100%",
         ),
         hint("Saved as you type. Shown when you hover the node and included in the DOT export."),
-        node_model_section(),
+        rx.cond(State.locked, hint(LOCKED_NOTE), node_model_section()),
         rx.hstack(
             small_button(rx.cond(State.picked_flagged, "Unflag", "Flag for review"),
                          State.toggle_flag_node),
-            small_button("Remove node", State.remove_node, color_scheme="red"),
+            rx.cond(~State.locked, small_button("Remove node", State.remove_node,
+                                                color_scheme="red")),
             small_button("Cancel", State.clear_selection, variant="ghost"),
             spacing="2", wrap="wrap",
         ),
@@ -853,16 +897,20 @@ def edge_details() -> rx.Component:
         hint(State.evidence_caption),
         rx.hstack(
             rx.cond(
-                State.selected_is_directed,
-                small_button("Reverse", State.reverse_edge),
-                rx.fragment(
-                    small_button("Keep direction", State.orient_edge),
+                ~State.locked,
+                rx.cond(
+                    State.selected_is_directed,
                     small_button("Reverse", State.reverse_edge),
+                    rx.fragment(
+                        small_button("Keep direction", State.orient_edge),
+                        small_button("Reverse", State.reverse_edge),
+                    ),
                 ),
             ),
             small_button(rx.cond(State.selected_edge_flagged, "Unflag", "Flag for review"),
                          State.toggle_flag_edge),
-            small_button("Delete edge", State.delete_edge, color_scheme="red"),
+            rx.cond(~State.locked, small_button("Delete edge", State.delete_edge,
+                                                color_scheme="red")),
             spacing="2", wrap="wrap",
         ),
         edge_plot(),
