@@ -5,7 +5,7 @@ A minimal [Reflex](https://reflex.dev) front end for
 propose a causal graph, edit it by hand, flag what needs a second look, and see
 each fitted relationship as a plot.
 
-![layout: controls on the left, graph in the centre, fitted relationship on the right](docs/screenshot.png)
+![DAG Studio after a fit: the steps on the left, the DAG with edges coloured by the sign of their fitted effect in the centre, and the selected edge's fitted curve, equation and fit quality on the right](docs/screenshot.png)
 
 ## What it computes
 
