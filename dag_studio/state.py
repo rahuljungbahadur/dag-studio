@@ -214,7 +214,7 @@ class State(rx.State):
     progress_known: bool = False  # False: the task cannot say how far along it is
 
     # --- grouped (panel) data -----------------------------------------
-    data_kind: str = "file"  # "file", or "demo" for the built-in data (which has no file)
+    data_kind: str = "file"  # "file", or "demo" / "demo_panel" for the built-in data (no file)
     all_columns: list[str] = []  # every column a group or time column could be
     group_cols: list[str] = []  # together they name a group, e.g. region and store; order is free
     time_col: str = ""
@@ -803,24 +803,12 @@ class State(rx.State):
         self._set_table(b.demo_table(), [note], "demo data", target="revenue", kind="demo")
 
     @rx.event
-    def load_test_file(self):
-        """Load the bundled messy CSV through the same cleaning as an upload."""
-        try:
-            df, notes, extras = b.load_dataset(b.TEST_FILE)
-        except Exception as exc:  # noqa: BLE001
-            self.error = f"Could not read the test file: {exc}"
-            return
-        self._set_table(df, notes, b.TEST_FILE.name, target="revenue", extras=extras)
-
-    @rx.event
-    def load_panel_test_file(self):
-        """Load the bundled panel CSV (region, store and week columns) for trying grouping."""
-        try:
-            df, notes, extras = b.load_dataset(b.PANEL_TEST_FILE)
-        except Exception as exc:  # noqa: BLE001
-            self.error = f"Could not read the panel test file: {exc}"
-            return
-        self._set_table(df, notes, b.PANEL_TEST_FILE.name, target="revenue", extras=extras)
+    def load_panel_demo(self):
+        """DAG Studio's panel demo: rows grouped by region and store, with a week column."""
+        df, _, extras = b.clean_table_with_extras(b.demo_panel_table())
+        note = "Synthetic panel data with a known DAG: 3 regions × 4 stores × 20 weeks."
+        self._set_table(df, [note], "demo panel data", target="revenue", extras=extras,
+                        kind="demo_panel")
 
     @rx.event
     def set_target(self, value: str):

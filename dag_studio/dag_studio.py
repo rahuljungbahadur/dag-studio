@@ -152,6 +152,37 @@ def grouping_controls() -> rx.Component:
     )
 
 
+DEMO_IID_INFO = (
+    "Synthetic data, 800 independent rows, with a known DAG: price → demand, promo → demand, "
+    "season → promo and demand, demand → revenue, price → revenue. noise is unrelated to "
+    "everything."
+)
+DEMO_PANEL_INFO = (
+    "Synthetic panel data: 3 regions × 4 stores × 20 weeks. Store names repeat across regions, "
+    "so group by region and store, with week as the time column. Known DAG: price → demand, "
+    "promo → demand, demand → revenue, price → revenue. footfall depends only on the group."
+)
+
+
+def demo_button(text: str, handler, info: str) -> rx.Component:
+    """A demo loader, with an (i) that explains the data on hover."""
+    return rx.hstack(
+        rx.button(text, on_click=handler, size="1", variant="soft", color_scheme="gray",
+                  flex="1"),
+        rx.tooltip(rx.icon("info", size=15, color=MUTED, cursor="help"), content=info),
+        spacing="2", align="center", width="100%",
+    )
+
+
+def demo_section() -> rx.Component:
+    return rx.vstack(
+        label("Demo"),
+        demo_button("Load data (iid)", State.load_demo, DEMO_IID_INFO),
+        demo_button("Load panel data", State.load_panel_demo, DEMO_PANEL_INFO),
+        spacing="2", width="100%", align="stretch", padding_top="6px",
+    )
+
+
 def data_step() -> rx.Component:
     return step(
         1, "Load data", "Upload a CSV or Parquet file. Numeric columns become nodes.",
@@ -177,29 +208,10 @@ def data_step() -> rx.Component:
             State.has_data,
             hint(State.filename, " · ", State.n_rows, " rows · ", State.columns.length(),
                  " variables", rx.cond(State.grouped, " (group means removed)", "")),
-            hint(
-                "No file yet? ",
-                rx.link("Load demo data", on_click=State.load_demo, size="1", underline="always"),
-            ),
         ),
         rx.foreach(State.notes, lambda note: hint(note)),
         grouping_controls(),
-        hint(
-            "Manual testing: ",
-            rx.link("Load test file", on_click=State.load_test_file, size="1",
-                    underline="always"),
-            " · ",
-            rx.link("Download test file", size="1", underline="always",
-                    on_click=rx.download(url=f"/{b.TEST_FILE.name}")),
-        ),
-        hint(
-            "Panel data: ",
-            rx.link("Load panel test file", on_click=State.load_panel_test_file, size="1",
-                    underline="always"),
-            " · ",
-            rx.link("Download", size="1", underline="always",
-                    on_click=rx.download(url=f"/{b.PANEL_TEST_FILE.name}")),
-        ),
+        demo_section(),
         needs_data=False,
     )
 

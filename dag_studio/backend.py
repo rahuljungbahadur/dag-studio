@@ -1951,8 +1951,10 @@ def test_file_table(n: int = 600, seed: int = 11) -> pl.DataFrame:
 PANEL_TEST_FILE = Path(__file__).resolve().parent.parent / "assets" / "dag_studio_panel_data.csv"
 
 
-def panel_test_table(seed: int = 5) -> pl.DataFrame:
-    """Raw panel data with known structure, for trying the grouping controls by hand.
+def demo_panel_table(seed: int = 5) -> pl.DataFrame:
+    """DAG Studio's panel demo: raw data with a known structure, for trying grouping.
+
+    Also written to ``assets/dag_studio_panel_data.csv`` (for tests, and to upload by hand).
 
     3 regions x 4 stores x 20 weeks. Store names (s1 to s4) repeat in every
     region, so a store is only identified by region *and* store. Each group has a

@@ -689,8 +689,8 @@ def test_clean_table_keeps_text_columns_in_step_with_the_rows_that_survive():
 
 def test_panel_test_file_is_current():
     on_disk = pl.read_csv(b.PANEL_TEST_FILE, infer_schema_length=10_000)
-    assert on_disk.equals(b.panel_test_table()), (
-        "Regenerate with: b.panel_test_table().write_csv(b.PANEL_TEST_FILE)"
+    assert on_disk.equals(b.demo_panel_table()), (
+        "Regenerate with: b.demo_panel_table().write_csv(b.PANEL_TEST_FILE)"
     )
 
 

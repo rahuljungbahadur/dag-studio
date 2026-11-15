@@ -442,3 +442,31 @@ def test_the_grouping_section_is_open_once_data_is_loaded():
     assert panel_state().grouping_open is True  # easy to find, not tucked away
     State.toggle_grouping.fn(st := panel_state())
     assert st.grouping_open is False and len(st.all_columns) > 0
+
+
+def test_the_demo_buttons_load_generated_data_with_no_file():
+    st = State(_reflex_internal_init=True)
+    State.load_demo.fn(st)
+    assert st.data_kind == "demo" and st.filename == "demo data" and st.target == "revenue"
+    assert st.columns == ["season", "price", "promo", "demand", "revenue", "noise"]
+    assert st.n_rows == 800 and st.group_candidates[:1] == ["season"]  # nothing to group by
+
+    State.load_panel_demo.fn(st)
+    assert st.data_kind == "demo_panel" and st.filename == "demo panel data"
+    assert st.target == "revenue" and st.n_rows == 240
+    assert st.notes == ["Synthetic panel data with a known DAG: 3 regions × 4 stores × 20 weeks."]
+    assert st.group_candidates[:2] == ["region", "store"]  # the text columns can name groups
+    assert st.group_cols == [] and st.grouping_open is True  # ready to group, not yet grouped
+    State.add_group_col.fn(st, "region")
+    State.add_group_col.fn(st, "store")
+    State.set_time_col.fn(st, "week")
+    assert st.group_headline == "12 groups (region × store), 20 rows each, balanced, 20 periods"
+    assert st.columns == ["price", "promo", "demand", "revenue", "footfall"]
+    # Loading a demo again starts clean.
+    State.load_demo.fn(st)
+    assert st.group_cols == [] and st.data_kind == "demo" and st.n_rows == 800
+
+
+def test_the_test_files_are_no_longer_offered_in_the_app():
+    for name in ("load_test_file", "load_panel_test_file"):
+        assert not hasattr(State, name)

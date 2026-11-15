@@ -53,6 +53,15 @@ def panel_snapshot() -> dict:
     )
 
 
+def panel_demo_snapshot() -> dict:
+    """What the app records after fitting the panel demo, grouped by region and store."""
+    df, _, extras = b.clean_table_with_extras(b.demo_panel_table())
+    data = b.apply_grouping(df.hstack(extras), ["region", "store"], "week", list(df.columns)).df
+    plan = b.prepare_fit(data, data.columns, PANEL_EDGES, "revenue", grouped=True)
+    return b.fit_snapshot(plan, "revenue", ["region", "store"], "week", "demo_panel",
+                          "demo panel data")
+
+
 def undefined_names(source: str) -> set[str]:
     """Names the script uses but never defines. Not scope-aware: it catches a missing helper."""
     tree = ast.parse(source)
@@ -81,8 +90,10 @@ def main_block(script: str) -> str:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("snapshot", [demo_snapshot(), file_snapshot(), panel_snapshot()],
-                         ids=["demo", "file", "grouped file"])
+@pytest.mark.parametrize(
+    "snapshot", [demo_snapshot(), file_snapshot(), panel_snapshot(), panel_demo_snapshot()],
+    ids=["demo", "file", "grouped file", "panel demo"],
+)
 def test_script_is_valid_python_that_defines_everything_it_uses(snapshot):
     script = export.build_script(snapshot)
     ast.parse(script)
@@ -129,6 +140,16 @@ def test_script_for_the_demo_data_needs_no_path():
     main = main_block(script)
     assert "data_path" not in main and "table = demo_table()" in main
     assert "def demo_table" in script and "clean_table_with_extras" not in script
+
+
+def test_script_for_the_panel_demo_generates_its_data_and_needs_no_path():
+    script = export.build_script(panel_demo_snapshot())
+    main = main_block(script)
+    assert "data_path" not in main and "Path" not in script
+    assert "table, _, extras = clean_table_with_extras(demo_panel_table())" in main
+    assert "def demo_panel_table" in script and "import numpy as np" in script
+    assert 'GROUP_COLUMNS = ["region", "store"]' in script
+    assert "built-in panel demo data (generated in the script)" in script
 
 
 def test_script_carries_only_what_this_fit_needs():
@@ -289,6 +310,15 @@ def test_script_refits_the_app_model_exactly_on_grouped_panel_data(tmp_path):
     fit = b.fit_model(panel_data(), panel_data().columns, PANEL_EDGES, "revenue", grouped=True)
     script = export.build_script(panel_snapshot(), data_path=str(b.PANEL_TEST_FILE))
     assert_same_model(run_script(script, tmp_path)["model"], fit.model)
+
+
+@pytest.mark.slow
+def test_script_refits_the_panel_demo_exactly_with_no_file(tmp_path):
+    df, _, extras = b.clean_table_with_extras(b.demo_panel_table())
+    data = b.apply_grouping(df.hstack(extras), ["region", "store"], "week", list(df.columns)).df
+    fit = b.fit_model(data, data.columns, PANEL_EDGES, "revenue", grouped=True)
+    assert_same_model(run_script(export.build_script(panel_demo_snapshot()), tmp_path)["model"],
+                      fit.model)
 
 
 @pytest.mark.slow

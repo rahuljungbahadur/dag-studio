@@ -85,7 +85,8 @@ def build_script(
     pairs = [tuple(pair) for pair in snapshot["pairs"]]
     used = sorted({node for pair in pairs for node in pair})
     dag = b.to_dot(used, [b.Edge(u, v) for u, v in pairs]).rstrip("\n")
-    outcome, demo = snapshot["outcome"], snapshot["data_kind"] == "demo"
+    outcome, kind = snapshot["outcome"], snapshot["data_kind"]
+    generated = kind in ("demo", "demo_panel")  # built-in data: made in the script, no file
     group_cols, time_col = snapshot["group_columns"], snapshot["time_column"]
     data_file, specs = snapshot["data_file"], snapshot["specs"]
     grouped = bool(group_cols)
@@ -95,10 +96,10 @@ def build_script(
     stdlib = ["import re"]
     if grouped:
         stdlib.append("from dataclasses import dataclass")
-    if not demo:
+    if not generated:
         stdlib.append("from pathlib import Path")
     third_party = ["import networkx as nx"]
-    if demo:
+    if generated:
         third_party.append("import numpy as np")
     third_party += ["import polars as pl", "from pathmc import BuildModelFromDAG"]
     if specs:
@@ -120,7 +121,12 @@ def build_script(
     ]
 
     # ---- the functions that prepare the data: copied from the app ------------------------
-    helpers = [b.demo_table] if demo else [b._safe_name, b.clean_table_with_extras]
+    if kind == "demo":
+        helpers = [b.demo_table]
+    elif kind == "demo_panel":
+        helpers = [b._safe_name, b.clean_table_with_extras, b.demo_panel_table]
+    else:
+        helpers = [b._safe_name, b.clean_table_with_extras]
     helper_text = ""
     if grouped:
         helper_text = "SHORT_GROUP_ROWS = %r\n\n\n" % b.SHORT_GROUP_ROWS
@@ -128,7 +134,7 @@ def build_script(
     helper_text += _source(helpers)
 
     # ---- __main__ ------------------------------------------------------------------------
-    if demo:
+    if kind == "demo":
         load = [
             "    # DAG Studio's built-in demo data, generated here: there is no file to load.",
             "    table = demo_table()",
@@ -136,6 +142,12 @@ def build_script(
         if grouped:
             load.append("    extras = pl.DataFrame()  # the demo data has no text columns")
         data_note = "DAG Studio's built-in demo data (generated in the script)"
+    elif kind == "demo_panel":
+        load = [
+            "    # DAG Studio's built-in panel demo, generated here: there is no file to load.",
+            "    table, _, extras = clean_table_with_extras(demo_panel_table())",
+        ]
+        data_note = "DAG Studio's built-in panel demo data (generated in the script)"
     else:
         reader = "pl.read_parquet(data_path)" if parquet else (
             "pl.read_csv(data_path, infer_schema_length=10_000)"

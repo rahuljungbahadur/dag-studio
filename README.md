@@ -49,7 +49,9 @@ uv run reflex run
 ```
 
 Open http://localhost:3000. The first start takes a minute while Reflex builds
-the front end. Use **Load demo data** to try it without a file.
+the front end. Use the **Demo** buttons in step 1 to try it without a file: **Load data (iid)**
+(800 independent rows) or **Load panel data** (regions, stores and weeks). Hover
+the (i) beside each for what is in it and the DAG it was built from.
 
 ## Using it
 
@@ -189,8 +191,8 @@ instruction.
       and `idata`, using the app's draws, chains and seed;
    4. prints the fitted parameters.
 
-   The built-in demo data has no file, so its script generates it instead and
-   needs no path. The script imports nothing from DAG Studio. A test runs the
+   The two built-in demos have no file, so their scripts generate the data
+   instead and need no path. The script imports nothing from DAG Studio. A test runs the
    exported script and compares its fitted model with the app's for demo,
    grouped and non-Gaussian fits; they agree to 1e-9 in the same process. The
    graph is added to a networkx graph in sorted order, in the app and in the
@@ -206,10 +208,18 @@ no longer on screen.
 
 ## Manual testing
 
-The left panel has **Load test file** and **Download test file** links for
-`assets/dag_studio_test_data.csv`, a messy dataset with a known structure.
-Loading it uses the same cleaning as an upload; downloading it lets you try the
-drop zone too. Things to check:
+Step 1 has a **Demo** section with two buttons: **Load data (iid)** and
+**Load panel data**. Both are generated in memory, so they need no file. Two
+datasets are also kept in `assets/` for tests; upload them with the drop zone
+when you want to try a messy file:
+
+- `assets/dag_studio_test_data.csv`: a messy iid dataset with a known structure
+  (text, constant and incomplete columns, a column name that gets renamed, and
+  a 0/1 column for the `bernoulli` family). The checks below that mention the
+  "test file" mean this one.
+- `assets/dag_studio_panel_data.csv`: the same data as **Load panel data**.
+
+Things to check, with the test file uploaded:
 
 - **Cleaning notes** list: `region` ignored (text), `tax_rate` ignored
   (constant), four columns renamed (`2024 price index` → `v_2024_price_index`),
@@ -235,9 +245,9 @@ drop zone too. Things to check:
   `bernoulli` on a continuous node such as `orders` shows an error straight
   away.
 
-- **Panel data**: press **Load panel test file** (a `region`, `store`, `week`
-  panel: 3 regions x 4 stores x 20 weeks, store names repeating across
-  regions). First **Discover DAG** with no grouping: the graph is wrong (an
+- **Panel data**: press **Load panel data** in the Demo section (a `region`,
+  `store`, `week` panel: 3 regions x 4 stores x 20 weeks, store names repeating
+  across regions). First **Discover DAG** with no grouping: the graph is wrong (an
   edge reversed, `footfall` linked to `price`, `price → revenue` missing).
   In *Panel data*, add `region` and `store`, and set the time column to
   `week`. The summary reads "12 groups (region × store), 20 rows each,
@@ -247,15 +257,16 @@ drop zone too. Things to check:
   adding only `store` to see the repeated-label warning, and set `demand` to
   `bernoulli` to see it refused. After a fit the price → demand slope is
   about -0.67 (true -0.8; ungrouped it is about -0.22).
-- **Export code**: with the test file loaded, import or discover a graph and
+- **Export code**: with the test file uploaded, import or discover a graph and
   **Fit model**, then press **Export code** and save `dag_studio_model.py` in an
   empty folder. Install the packages on its `pip install` line, set `data_path`
-  in the `__main__` section to `dag_studio_test_data.csv` (use **Download test
-  file** to get it), and run `python dag_studio_model.py`. It prints the same
-  parameter values as the app shows in the equations, and `model` and `idata`
-  are the fitted model. Edit the graph after fitting: Export code still gives
-  the graph that was fitted. With the demo data no path is needed.
-- **Import**: with the test file loaded, paste this into the box in step 2 and
+  in the `__main__` section to the path of `assets/dag_studio_test_data.csv`,
+  and run `python dag_studio_model.py`. It prints the same parameter values as
+  the app shows in the equations, and `model` and `idata` are the fitted model.
+  Edit the graph after fitting: Export code still gives the graph that was
+  fitted. With either Demo button the script generates its own data, so no path
+  is needed.
+- **Import**: with the test file uploaded, paste this into the box in step 2 and
   press **Import pasted DAG** (`2024 price index` is matched to
   `v_2024_price_index`):
 
